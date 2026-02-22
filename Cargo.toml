@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fnprint-trace",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/1rhino2/fnprint"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+goblin = "0.8"
+gimli = "0.31"
+capstone = "0.12"
+unicorn-engine = "2.1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
