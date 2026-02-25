@@ -220,3 +220,52 @@ impl Default for Fnv {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_is_stable_and_distinct() {
+        let a = Effect::Write {
+            region: Region::Arg(0),
+            off: 8,
+            val: ValueClass::Input(1),
+        };
+        let b = Effect::Write {
+            region: Region::Arg(0),
+            off: 8,
+            val: ValueClass::Input(1),
+        };
+        let c = Effect::Write {
+            region: Region::Arg(0),
+            off: 16,
+            val: ValueClass::Input(1),
+        };
+        assert_eq!(a.token(), b.token());
+        assert_ne!(a.token(), c.token());
+    }
+
+    #[test]
+    fn complexity_withholds_tiny() {
+        let thunk = EffectTrace {
+            effects: vec![Effect::Ret(ValueClass::Input(0))],
+            instret: 2,
+            capped: false,
+        };
+        assert!(thunk.complexity() < 3);
+        let real = EffectTrace {
+            effects: vec![
+                Effect::NewRegion(Region::Arg(0)),
+                Effect::Write {
+                    region: Region::Arg(0),
+                    off: 0,
+                    val: ValueClass::Input(1),
+                },
+                Effect::Call(CallTarget::Sym("memcpy".into())),
+            ],
+            instret: 40,
+            capped: false,
+        };
+        assert!(real.complexity() >= 3);
+    }
+}
