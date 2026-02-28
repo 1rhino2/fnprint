@@ -1,0 +1,10 @@
+[package]
+name = "fnprint-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+goblin = { workspace = true }
+gimli = { workspace = true }
