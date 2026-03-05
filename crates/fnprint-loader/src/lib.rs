@@ -108,7 +108,7 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
     })
 }
 
-fn discover(elf: &Elf, _raw: &[u8]) -> Result<Vec<Func>> {
+fn discover(elf: &Elf, raw: &[u8]) -> Result<Vec<Func>> {
     let mut out = Vec::new();
 
     for (sym, src) in elf
@@ -137,6 +137,57 @@ fn discover(elf: &Elf, _raw: &[u8]) -> Result<Vec<Func>> {
         });
     }
 
+    // stripped? lean on unwind info.
+    if out.is_empty() {
+        if let Some(mut fdes) = eh_frame_funcs(elf, raw) {
+            out.append(&mut fdes);
+        }
+    }
+
     Ok(out)
+}
+
+// pull function start+length out of every FDE in .eh_frame.
+fn eh_frame_funcs(elf: &Elf, raw: &[u8]) -> Option<Vec<Func>> {
+    use gimli::{BaseAddresses, CieOrFde, EhFrame, LittleEndian, UnwindSection};
+
+    let sh = elf
+        .section_headers
+        .iter()
+        .find(|s| elf.shdr_strtab.get_at(s.sh_name) == Some(".eh_frame"))?;
+    let start = sh.sh_offset as usize;
+    let data = raw.get(start..start + sh.sh_size as usize)?;
+
+    let eh = EhFrame::new(data, LittleEndian);
+    let bases = BaseAddresses::default().set_eh_frame(sh.sh_addr);
+
+    let mut entries = eh.entries(&bases);
+    let mut out = Vec::new();
+    loop {
+        match entries.next() {
+            Ok(Some(CieOrFde::Fde(partial))) => {
+                if let Ok(fde) = partial.parse(EhFrame::cie_from_offset) {
+                    let entry = fde.initial_address();
+                    let size = fde.len();
+                    if size > 0 {
+                        out.push(Func {
+                            name: None,
+                            entry,
+                            size,
+                            source: FuncSource::EhFrame,
+                        });
+                    }
+                }
+            }
+            Ok(Some(CieOrFde::Cie(_))) => {}
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
