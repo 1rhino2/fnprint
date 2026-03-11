@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/fnprint-loader",
     "crates/fnprint-trace",
+    "crates/fnprint-sig",
 ]
 
 [workspace.package]

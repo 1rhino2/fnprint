@@ -1,0 +1,9 @@
+[package]
+name = "fnprint-sig"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+fnprint-trace = { path = "../fnprint-trace" }
