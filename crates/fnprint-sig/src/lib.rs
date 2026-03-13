@@ -173,3 +173,95 @@ const PERM_B: [u64; 8] = [
     0x2545f4914f6cdd1d,
 ];
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fnprint_trace::{Effect, Region, ValueClass};
+
+    fn tr(effects: Vec<Effect>) -> EffectTrace {
+        EffectTrace {
+            effects,
+            instret: 100,
+            capped: false,
+        }
+    }
+
+    #[test]
+    fn identical_traces_match_exactly() {
+        let e = vec![
+            Effect::NewRegion(Region::Arg(0)),
+            Effect::Write {
+                region: Region::Arg(0),
+                off: 0,
+                val: ValueClass::Input(1),
+            },
+            Effect::Write {
+                region: Region::Arg(0),
+                off: 8,
+                val: ValueClass::SmallConst(1),
+            },
+            Effect::Ret(ValueClass::Input(0)),
+        ];
+        let a = Fingerprint::from_trace(&tr(e.clone()));
+        let b = Fingerprint::from_trace(&tr(e));
+        assert_eq!(a.similarity(&b), 1.0);
+    }
+
+    #[test]
+    fn small_edit_stays_close_unrelated_stays_far() {
+        // realistic-size function: a dozen effects, one changed by a recompile.
+        let mut base = Vec::new();
+        base.push(Effect::NewRegion(Region::Arg(0)));
+        for i in 0..8 {
+            base.push(Effect::Write {
+                region: Region::Arg(0),
+                off: i * 8,
+                val: ValueClass::Input((i % 3) as u16),
+            });
+        }
+        base.push(Effect::Call(fnprint_trace::CallTarget::Sym(
+            "memcpy".into(),
+        )));
+        base.push(Effect::Branch);
+        base.push(Effect::Ret(ValueClass::Input(0)));
+
+        let mut edit = base.clone();
+        // one write value differs, like a compiler picked a different reg
+        edit[4] = Effect::Write {
+            region: Region::Arg(0),
+            off: 24,
+            val: ValueClass::SmallConst(7),
+        };
+
+        let unrel = vec![
+            Effect::Call(fnprint_trace::CallTarget::Sym("malloc".into())),
+            Effect::NewRegion(Region::Heapish),
+            Effect::Call(fnprint_trace::CallTarget::Sym("free".into())),
+            Effect::Branch,
+            Effect::Branch,
+            Effect::Syscall(1),
+            Effect::Ret(ValueClass::BigConst),
+        ];
+
+        let a = Fingerprint::from_trace(&tr(base));
+        let b = Fingerprint::from_trace(&tr(edit));
+        let c = Fingerprint::from_trace(&tr(unrel));
+        let close = a.similarity(&b);
+        let far = a.similarity(&c);
+        assert!(close > 0.6, "edit similarity too low: {close}");
+        assert!(far < 0.25, "unrelated too high: {far}");
+        assert!(close > far);
+    }
+
+    #[test]
+    fn minhash_estimate_tracks_true_jaccard() {
+        // build two token sets with a known overlap, check the estimate is close
+        let a: Vec<u64> = (0..200u64).collect();
+        let b: Vec<u64> = (100..300u64).collect(); // jaccard = 100/300 = 0.333
+        let sa = minhash(&a);
+        let sb = minhash(&b);
+        let eq = sa.iter().zip(&sb).filter(|(x, y)| x == y).count();
+        let est = eq as f64 / SIG_LEN as f64;
+        assert!((est - 0.333).abs() < 0.12, "estimate {est} off from 0.333");
+    }
+}
