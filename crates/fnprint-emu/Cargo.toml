@@ -1,0 +1,11 @@
+[package]
+name = "fnprint-emu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+unicorn-engine = { workspace = true }
+capstone = { workspace = true }
+fnprint-trace = { path = "../fnprint-trace" }
+fnprint-loader = { path = "../fnprint-loader" }

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/fnprint-loader",
+    "crates/fnprint-emu",
     "crates/fnprint-trace",
     "crates/fnprint-sig",
 ]
