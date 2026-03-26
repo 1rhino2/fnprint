@@ -32,6 +32,10 @@ pub struct Config {
     pub timeout_us: u64,
     pub seed: u64,
     pub max_heapish: usize,
+    /// stop after this many effects. bounds the garbage-fed tail of big
+    /// data-dependent functions, which is both noise and build-specific, so
+    /// the print reflects stable early behavior. also keeps runs fast.
+    pub max_effects: usize,
     /// experimental path exploration: flip the first N branch outcomes to step
     /// past validation gates. off by default (0) because forced impossible
     /// paths add build-specific noise that hurts cross-build matching. see the
@@ -47,6 +51,7 @@ impl Default for Config {
             timeout_us: 250_000,
             seed: 0,
             max_heapish: 24,
+            max_effects: 96,
             explore_depth: 0,
         }
     }
@@ -417,7 +422,10 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
             rec.instret += 1;
             let c = rec.visits.entry(addr).or_insert(0);
             *c += 1;
-            if *c > rec.cfg.visit_cap || rec.instret > rec.cfg.instr_cap {
+            if *c > rec.cfg.visit_cap
+                || rec.instret > rec.cfg.instr_cap
+                || rec.effects.len() >= rec.cfg.max_effects
+            {
                 rec.capped = true;
                 uc.emu_stop().ok();
                 return;
