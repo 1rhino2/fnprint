@@ -600,3 +600,116 @@ fn bucket_off(off: i64) -> i32 {
     b.clamp(-2048, 2048) as i32
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fnprint_loader::{FuncSource, Segment};
+
+    // build a tiny image out of raw machine code at 0x401000
+    fn img(code: &[u8]) -> Image {
+        Image {
+            segments: vec![Segment {
+                vaddr: 0x401000,
+                bytes: code.to_vec(),
+                exec: true,
+                write: false,
+            }],
+            entry: 0x401000,
+            is_pie: false,
+        }
+    }
+    fn f() -> Func {
+        Func {
+            name: None,
+            entry: 0x401000,
+            size: 0x100,
+            source: FuncSource::Symtab,
+        }
+    }
+
+    #[test]
+    fn writes_arg0_and_returns_it() {
+        // mov [rdi], rsi ; mov rax, rdi ; ret
+        let code = [0x48, 0x89, 0x37, 0x48, 0x89, 0xf8, 0xc3];
+        let t = MicroExec::new(Config::default()).run(&img(&code), &f(), &HashMap::new());
+        let has_write = t.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::Write {
+                    region: Region::Arg(0),
+                    val: ValueClass::Input(1),
+                    ..
+                }
+            )
+        });
+        let ret_arg0 = t
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::Ret(ValueClass::Input(0))));
+        assert!(
+            has_write,
+            "missing write of arg1 into arg0 buffer: {:?}",
+            t.effects
+        );
+        assert!(ret_arg0, "should return arg0: {:?}", t.effects);
+    }
+
+    #[test]
+    fn stubs_calls_and_records_name() {
+        // call rel32 to 0x401100 ; ret. symbol map names that target.
+        // e8 <rel> where rel = 0x401100 - (0x401000+5) = 0xfb
+        let code = [0xe8, 0xfb, 0x00, 0x00, 0x00, 0xc3];
+        let mut syms = HashMap::new();
+        syms.insert(0x401100u64, "do_thing".to_string());
+        let t = MicroExec::new(Config::default()).run(&img(&code), &f(), &syms);
+        let named = t.effects.iter().any(|e| {
+            matches!(e,
+            Effect::Call(CallTarget::Sym(n)) if n == "do_thing")
+        });
+        assert!(named, "should stub+name the call: {:?}", t.effects);
+        // and it must have returned (call was skipped, not dived into)
+        assert!(t.effects.iter().any(|e| matches!(e, Effect::Ret(_))));
+    }
+
+    #[test]
+    fn deterministic_across_runs() {
+        // mov rax,[rdi] ; mov [rdi+8],rax ; ret  (chases a pointer, writes back)
+        let code = [0x48, 0x8b, 0x07, 0x48, 0x89, 0x47, 0x08, 0xc3];
+        let ex = MicroExec::new(Config::default());
+        let a = ex.run(&img(&code), &f(), &HashMap::new());
+        let b = ex.run(&img(&code), &f(), &HashMap::new());
+        assert_eq!(a.tokens(), b.tokens());
+    }
+
+    #[test]
+    fn effect_cap_is_respected() {
+        // a long run of writes must stop at max_effects, not grow forever.
+        // mov [rdi+rax*8], rax ; inc rax ; jmp back  (writes then loops)
+        // simpler: unrolled-ish store loop via a tight self-jump with a store.
+        // 48 89 07  mov [rdi],rax ; 48 ff c0 inc rax ; 48 89 07 ...; eb xx
+        let mut code = Vec::new();
+        for _ in 0..200 {
+            code.extend_from_slice(&[0x48, 0x89, 0x07]); // mov [rdi], rax
+            code.extend_from_slice(&[0x48, 0xff, 0xc7]); // inc rdi
+        }
+        code.push(0xc3);
+        let cfg = Config {
+            max_effects: 32,
+            ..Config::default()
+        };
+        let t = MicroExec::new(cfg).run(&img(&code), &f(), &HashMap::new());
+        assert!(
+            t.effects.len() <= 40,
+            "effects not capped: {}",
+            t.effects.len()
+        );
+    }
+
+    #[test]
+    fn wild_loop_gets_capped_not_hung() {
+        // jmp $ (eb fe) -> infinite. visit cap must stop it.
+        let code = [0xeb, 0xfe];
+        let t = MicroExec::new(Config::default()).run(&img(&code), &f(), &HashMap::new());
+        assert!(t.capped, "infinite loop should be capped");
+    }
+}
