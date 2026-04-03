@@ -5,6 +5,7 @@ members = [
     "crates/fnprint-emu",
     "crates/fnprint-trace",
     "crates/fnprint-sig",
+    "crates/fnprint-db",
 ]
 
 [workspace.package]
