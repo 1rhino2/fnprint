@@ -160,3 +160,30 @@ fn decode_sig(bytes: &[u8]) -> Vec<u64> {
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fnprint_sig::Fingerprint;
+
+    fn fp(seed: u64) -> Fingerprint {
+        Fingerprint {
+            sig: (0..SIG_LEN as u64).map(|i| i ^ seed).collect(),
+            shingles: 10,
+            complexity: 5,
+            capped: false,
+        }
+    }
+
+    #[test]
+    fn roundtrip_and_candidates() {
+        let db = Db::open_memory().unwrap();
+        db.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0))
+            .unwrap();
+        db.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(999))
+            .unwrap();
+        assert_eq!(db.all().unwrap().len(), 2);
+        // querying with foo's own print must surface foo as a candidate
+        let cands = db.candidates(&fp(0)).unwrap();
+        assert!(cands.iter().any(|c| c.name.as_deref() == Some("foo")));
+    }
+}
