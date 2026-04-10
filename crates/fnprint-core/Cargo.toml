@@ -1,0 +1,14 @@
+[package]
+name = "fnprint-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+rayon = { workspace = true }
+fnprint-loader = { path = "../fnprint-loader" }
+fnprint-emu = { path = "../fnprint-emu" }
+fnprint-sig = { path = "../fnprint-sig" }
+fnprint-db = { path = "../fnprint-db" }
+fnprint-trace = { path = "../fnprint-trace" }
