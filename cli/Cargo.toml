@@ -1,0 +1,17 @@
+[package]
+name = "fnprint-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fnprint"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+fnprint-core = { path = "../crates/fnprint-core" }
+fnprint-db = { path = "../crates/fnprint-db" }
+fnprint-loader = { path = "../crates/fnprint-loader" }
+fnprint-emu = { path = "../crates/fnprint-emu" }
