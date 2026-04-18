@@ -331,3 +331,53 @@ pub fn dump_traces(
     Ok(ex.run_explore(image, f, &symbols, &SEEDS))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // a tiny position-independent ELF-less path isn't easy here, so we test the
+    // matcher/eval logic on hand-built indexes instead. loader+emu are covered
+    // in their own crates and end-to-end by the bench harness.
+    fn ifunc(name: &str, sig_seed: u64, complexity: u32) -> IndexedFunc {
+        IndexedFunc {
+            name: Some(name.to_string()),
+            entry: 0,
+            source: FuncSource::Symtab,
+            fp: fnprint_sig::Fingerprint {
+                sig: (0..fnprint_sig::SIG_LEN as u64)
+                    .map(|i| i.wrapping_mul(sig_seed))
+                    .collect(),
+                shingles: 20,
+                complexity,
+                capped: false,
+            },
+        }
+    }
+
+    #[test]
+    fn identical_indexes_report_no_changes() {
+        let a = vec![ifunc("foo", 3, 10), ifunc("bar", 7, 10)];
+        let b = vec![ifunc("foo", 3, 10), ifunc("bar", 7, 10)];
+        let rep = match_by_name(&a, &b);
+        assert_eq!(rep.changed.len(), 0);
+        assert_eq!(rep.same, 2);
+    }
+
+    #[test]
+    fn changed_behavior_is_flagged() {
+        let a = vec![ifunc("foo", 3, 10)];
+        let b = vec![ifunc("foo", 999, 10)]; // very different sig
+        let rep = match_by_name(&a, &b);
+        assert_eq!(rep.changed.len(), 1);
+    }
+
+    #[test]
+    fn low_signal_not_called_changed() {
+        // same name, low complexity on one side -> low_signal, never "changed"
+        let a = vec![ifunc("foo", 3, 2)];
+        let b = vec![ifunc("foo", 999, 2)];
+        let rep = match_by_name(&a, &b);
+        assert_eq!(rep.changed.len(), 0);
+        assert_eq!(rep.low_signal, 1);
+    }
+}
