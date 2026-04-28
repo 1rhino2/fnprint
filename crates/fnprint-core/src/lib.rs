@@ -10,7 +10,7 @@ use fnprint_sig::Fingerprint;
 use rayon::prelude::*;
 
 /// below this we don't trust a match, thunks and tiny leaves all look alike
-pub const MIN_COMPLEXITY: u32 = 3;
+pub const MIN_COMPLEXITY: u32 = 4;
 /// two prints this close are "the same function"
 pub const SAME_THRESH: f64 = 0.88;
 /// fixed seeds used per function. deterministic, so prints are reproducible.
