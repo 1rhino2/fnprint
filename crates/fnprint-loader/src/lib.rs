@@ -191,3 +191,24 @@ fn eh_frame_funcs(elf: &Elf, raw: &[u8]) -> Option<Vec<Func>> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn garbage_input_errors_not_panics() {
+        assert!(load(b"").is_err());
+        assert!(load(b"not an elf at all, just text here").is_err());
+        // elf magic then garbage bytes
+        let mut junk = vec![0x7f, b'E', b'L', b'F'];
+        junk.extend(std::iter::repeat_n(0x41u8, 400));
+        let _ = load(&junk); // must return Err/Ok, never panic
+    }
+
+    #[test]
+    fn truncated_header_does_not_panic() {
+        let mut hdr = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+        hdr.extend(std::iter::repeat_n(0u8, 48));
+        let _ = load(&hdr);
+    }
+}
