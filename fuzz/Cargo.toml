@@ -1,0 +1,29 @@
+[package]
+name = "fnprint-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fnprint-loader = { path = "../crates/fnprint-loader" }
+fnprint-core = { path = "../crates/fnprint-core" }
+fnprint-emu = { path = "../crates/fnprint-emu" }
+
+# keep this out of the main workspace, cargo-fuzz builds it on its own
+[workspace]
+
+[[bin]]
+name = "loader"
+path = "fuzz_targets/loader.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "index"
+path = "fuzz_targets/index.rs"
+test = false
+doc = false
