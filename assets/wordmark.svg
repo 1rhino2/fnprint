@@ -1,0 +1,26 @@
+<svg width="520" height="160" viewBox="0 0 520 160" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="fnprint">
+  <g transform="translate(8,12) scale(0.52)">
+    <g fill="none" stroke="#242830" stroke-width="9" stroke-linejoin="round" stroke-linecap="round">
+      <path d="M78 96 C64 70 74 58 92 66 L104 92 Z" fill="#7c8a9c"/>
+      <path d="M178 96 C192 70 182 58 164 66 L152 92 Z" fill="#7c8a9c"/>
+      <path d="M128 74 C176 74 206 104 206 150 C206 200 172 224 128 224 C84 224 50 200 50 150 C50 104 80 74 128 74 Z" fill="#6e7b8b"/>
+      <path d="M92 168 C92 150 108 142 128 142 C148 142 164 150 164 168 C164 190 148 202 128 202 C108 202 92 190 92 168 Z" fill="#ece4d6"/>
+      <ellipse cx="74" cy="170" rx="12" ry="9" fill="#e79c86" stroke="none"/>
+      <ellipse cx="182" cy="170" rx="12" ry="9" fill="#e79c86" stroke="none"/>
+      <circle cx="100" cy="132" r="8.5" fill="#242830" stroke="none"/>
+      <circle cx="156" cy="132" r="8.5" fill="#242830" stroke="none"/>
+      <circle cx="103" cy="129" r="2.6" fill="#fff" stroke="none"/>
+      <circle cx="159" cy="129" r="2.6" fill="#fff" stroke="none"/>
+      <circle cx="116" cy="176" r="4.2" fill="#242830" stroke="none"/>
+      <circle cx="140" cy="176" r="4.2" fill="#242830" stroke="none"/>
+      <path d="M112 150 C112 118 122 70 128 44 C134 70 144 118 144 150 Z" fill="#e9a05c"/>
+      <g fill="none" stroke="#9a6127" stroke-width="3.2" stroke-linecap="round">
+        <path d="M118 138 C124 133 132 133 138 138"/>
+        <path d="M119 120 C124 114 132 114 137 120"/>
+        <path d="M121 100 C125 94 131 94 135 100"/>
+      </g>
+    </g>
+  </g>
+  <text x="150" y="82" font-family="ui-monospace,'DejaVu Sans Mono',Menlo,Consolas,monospace" font-size="58" font-weight="700" fill="#2a2e35">fnprint</text>
+  <text x="152" y="116" font-family="ui-monospace,'DejaVu Sans Mono',Menlo,Consolas,monospace" font-size="19" fill="#6e7b8b">match functions by what they do</text>
+</svg>
