@@ -6,7 +6,7 @@ fnprint matches functions in binaries by what they *do*, not by what their bytes
 or control-flow graphs look like. it runs each function in a tiny emulator with
 made-up inputs, records the side effects it produces, and hashes that behavior
 into a fingerprint. two functions that behave the same get similar fingerprints,
-even if they were built by a differet compiler or at a different optimization
+even if they were built by a different compiler or at a different optimization
 level.
 
 the point of doing it this way: byte signatures (FLIRT, FunctionID) break the
