@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libunicorn-dev libcapstone-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all
+      - name: bench smoke (a couple of pairs)
+        run: |
+          cargo build --release
+          bench/build_zlib.sh bench/work
+          ./target/release/fnprint eval bench/work/builds/libz_gcc_O0.so bench/work/builds/libz_gcc_O2.so
