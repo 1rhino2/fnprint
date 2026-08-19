@@ -3,6 +3,8 @@ name = "fnprint-trace"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Architecture-neutral effect model behind fnprint behavioral fingerprints"
+repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }

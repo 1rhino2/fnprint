@@ -3,9 +3,11 @@ name = "fnprint-emu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Microexecution engine that records function behavior for fnprint"
+repository.workspace = true
 
 [dependencies]
 unicorn-engine = { workspace = true }
 capstone = { workspace = true }
-fnprint-trace = { path = "../fnprint-trace" }
-fnprint-loader = { path = "../fnprint-loader" }
+fnprint-trace = { path = "../fnprint-trace", version = "0.1.0" }
+fnprint-loader = { path = "../fnprint-loader", version = "0.1.0" }

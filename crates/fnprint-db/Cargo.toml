@@ -3,8 +3,10 @@ name = "fnprint-db"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "SQLite fingerprint store for fnprint"
+repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
-fnprint-sig = { path = "../fnprint-sig" }
+fnprint-sig = { path = "../fnprint-sig", version = "0.1.0" }

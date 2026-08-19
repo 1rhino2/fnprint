@@ -3,7 +3,9 @@ name = "fnprint-sig"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "MinHash/LSH behavioral fingerprints for fnprint"
+repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
-fnprint-trace = { path = "../fnprint-trace" }
+fnprint-trace = { path = "../fnprint-trace", version = "0.1.0" }

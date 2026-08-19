@@ -3,6 +3,8 @@ name = "fnprint-loader"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "ELF loading and function discovery for fnprint"
+repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }

@@ -1,8 +1,13 @@
 [package]
-name = "fnprint-cli"
+name = "fnprint"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Match functions in binaries by what they do, not what their bytes look like"
+repository.workspace = true
+keywords = ["reverse-engineering", "binary-analysis", "fingerprint", "disassembly", "security"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "../README.md"
 
 [[bin]]
 name = "fnprint"
@@ -11,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-fnprint-core = { path = "../crates/fnprint-core" }
-fnprint-db = { path = "../crates/fnprint-db" }
-fnprint-loader = { path = "../crates/fnprint-loader" }
-fnprint-emu = { path = "../crates/fnprint-emu" }
+fnprint-core = { path = "../crates/fnprint-core", version = "0.1.0" }
+fnprint-db = { path = "../crates/fnprint-db", version = "0.1.0" }
+fnprint-loader = { path = "../crates/fnprint-loader", version = "0.1.0" }
+fnprint-emu = { path = "../crates/fnprint-emu", version = "0.1.0" }
