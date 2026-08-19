@@ -8,7 +8,7 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: deps
         run: sudo apt-get update && sudo apt-get install -y libunicorn-dev libcapstone-dev
       - uses: dtolnay/rust-toolchain@stable
@@ -17,8 +17,17 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
-      - name: bench smoke (a couple of pairs)
+      - name: end-to-end smoke
         run: |
           cargo build --release
-          bench/build_zlib.sh bench/work
-          ./target/release/fnprint eval bench/work/builds/libz_gcc_O0.so bench/work/builds/libz_gcc_O2.so
+          cat > /tmp/smoke.c <<'C'
+          #include <stddef.h>
+          void copy_rev(char *d, const char *s, size_t n){ for(size_t i=0;i<n;i++) d[i]=s[n-1-i]; }
+          int sum_sq(const int *a, size_t n){ int s=0; for(size_t i=0;i<n;i++) s+=a[i]*a[i]; return s; }
+          size_t find_byte(const char *s, size_t n, char c){ for(size_t i=0;i<n;i++) if(s[i]==c) return i; return n; }
+          void swap_fields(long *p){ long t=p[0]; p[0]=p[2]; p[2]=t; p[1]^=p[3]; }
+          int checksum(const unsigned char *b, size_t n){ int c=0; for(size_t i=0;i<n;i++){ c=(c<<3)^b[i]^(c>>5);} return c; }
+          C
+          gcc -shared -fPIC -O0 /tmp/smoke.c -o /tmp/sa.so
+          gcc -shared -fPIC -O2 /tmp/smoke.c -o /tmp/sb.so
+          ./target/release/fnprint eval /tmp/sa.so /tmp/sb.so
