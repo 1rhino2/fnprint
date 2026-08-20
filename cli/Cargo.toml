@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-fnprint-core = { path = "../crates/fnprint-core", version = "0.1.0" }
-fnprint-db = { path = "../crates/fnprint-db", version = "0.1.0" }
-fnprint-loader = { path = "../crates/fnprint-loader", version = "0.1.0" }
-fnprint-emu = { path = "../crates/fnprint-emu", version = "0.1.0" }
+fnprint-core = { path = "../crates/fnprint-core", version = "0.2.0" }
+fnprint-db = { path = "../crates/fnprint-db", version = "0.2.0" }
+fnprint-loader = { path = "../crates/fnprint-loader", version = "0.2.0" }
+fnprint-emu = { path = "../crates/fnprint-emu", version = "0.2.0" }

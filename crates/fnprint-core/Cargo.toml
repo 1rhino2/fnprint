@@ -9,8 +9,8 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 rayon = { workspace = true }
-fnprint-loader = { path = "../fnprint-loader", version = "0.1.0" }
-fnprint-emu = { path = "../fnprint-emu", version = "0.1.0" }
-fnprint-sig = { path = "../fnprint-sig", version = "0.1.0" }
-fnprint-db = { path = "../fnprint-db", version = "0.1.0" }
-fnprint-trace = { path = "../fnprint-trace", version = "0.1.0" }
+fnprint-loader = { path = "../fnprint-loader", version = "0.2.0" }
+fnprint-emu = { path = "../fnprint-emu", version = "0.2.0" }
+fnprint-sig = { path = "../fnprint-sig", version = "0.2.0" }
+fnprint-db = { path = "../fnprint-db", version = "0.2.0" }
+fnprint-trace = { path = "../fnprint-trace", version = "0.2.0" }
