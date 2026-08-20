@@ -28,7 +28,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-bincode = "1.3"
+postcard = { version = "1", features = ["use-std"] }
 
 # hardened release build: no unwinding into a bad state, overflow aborts instead
 # of wrapping into a bad index, and strip symbols.

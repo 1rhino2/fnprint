@@ -90,7 +90,7 @@ enum Cmd {
 fn main() -> Result<()> {
     // privsep worker entrypoint. the parent re-execs itself as
     // `fnprint __worker <op> [func]`; the worker jails itself, reads the
-    // untrusted binary from stdin, and writes a bincode reply to stdout. we
+    // untrusted binary from stdin, and writes a postcard reply to stdout. we
     // intercept it before clap so the worker protocol stays out of the cli.
     let mut raw = std::env::args();
     let _bin = raw.next();
@@ -188,7 +188,7 @@ fn render_traces(traces: &[EffectTrace]) -> Vec<String> {
 }
 
 fn emit(reply: &WorkerReply) -> Result<()> {
-    let buf = bincode::serialize(reply).context("serializing worker reply")?;
+    let buf = postcard::to_allocvec(reply).context("serializing worker reply")?;
     std::io::stdout()
         .lock()
         .write_all(&buf)
@@ -199,7 +199,7 @@ fn emit(reply: &WorkerReply) -> Result<()> {
 // ---- parent side of privsep -------------------------------------------------
 
 // re-exec self as the jailed worker, hand it the bytes over stdin, read its
-// bincode reply back. the input is written on a separate thread so a large ELF
+// postcard reply back. the input is written on a separate thread so a large ELF
 // can't deadlock against the reply on a full pipe.
 fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply> {
     let exe = std::env::current_exe().context("locating self for worker re-exec")?;
@@ -239,7 +239,7 @@ fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply>
     if out.len() as u64 > MAX_REPLY {
         bail!("jailed worker reply over size cap");
     }
-    let reply: WorkerReply = bincode::deserialize(&out).context("decoding worker reply")?;
+    let reply: WorkerReply = postcard::from_bytes(&out).context("decoding worker reply")?;
     Ok(reply)
 }
 
