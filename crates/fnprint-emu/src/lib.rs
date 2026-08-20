@@ -132,7 +132,7 @@ impl Rec {
             }
         }
         if (STACK_BASE..STACK_BASE + STACK_SIZE).contains(&addr) {
-            return (Region::Stack, addr as i64 - RSP0 as i64);
+            return (Region::Stack, (addr as i64).wrapping_sub(RSP0 as i64));
         }
         for &(lo, hi) in &self.segs {
             if addr >= lo && addr < hi {
@@ -507,7 +507,7 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
                 match (forced, target) {
                     (Some(dir), Some(t)) => {
                         // redirect to the chosen successor, skip the real jcc
-                        let dest = if dir { t } else { addr + ilen };
+                        let dest = if dir { t } else { addr.wrapping_add(ilen) };
                         let _ = uc.reg_write(RegisterX86::RIP, dest);
                     }
                     _ => {

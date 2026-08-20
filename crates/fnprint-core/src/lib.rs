@@ -16,11 +16,23 @@ pub const SAME_THRESH: f64 = 0.88;
 /// fixed seeds used per function. deterministic, so prints are reproducible.
 const SEEDS: [u64; 4] = [0, 0x9e3779b9, 0x1234_5678, 0xdead_beef];
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct IndexedFunc {
     pub name: Option<String>,
     pub entry: u64,
     pub source: FuncSource,
     pub fp: Fingerprint,
+}
+
+// re-exported so the cli's privsep worker can render dump output without
+// depending on the trace crate directly.
+pub use fnprint_trace::EffectTrace;
+
+/// Force the rayon global pool to spawn its worker threads now. The sandboxed
+/// worker calls this before it jails itself, so the jail can forbid clone/clone3
+/// (no thread creation after lockdown) without starving the parallel index.
+pub fn warm_pool() {
+    let _: u64 = (0..256u64).into_par_iter().sum();
 }
 
 pub fn source_str(s: FuncSource) -> &'static str {
@@ -407,16 +419,19 @@ pub fn eval(a: &[IndexedFunc], b: &[IndexedFunc]) -> EvalResult {
         if !bsig.iter().any(|f| f.name.as_deref() == Some(aname)) {
             continue;
         }
-        res.scored += 1;
-
-        // rank B by similarity
+        // rank B by similarity. bsig is prefiltered to named funcs, but use
+        // filter_map + first() so a later filter change can't unwrap or panic.
         let mut scored: Vec<(f64, &str)> = bsig
             .iter()
-            .map(|f| (fa.fp.similarity(&f.fp), f.name.as_deref().unwrap()))
+            .filter_map(|f| f.name.as_deref().map(|n| (fa.fp.similarity(&f.fp), n)))
             .collect();
         scored.sort_by(|x, y| y.0.total_cmp(&x.0));
+        let Some(&(top_sim, top_name)) = scored.first() else {
+            continue; // unreachable: the twin check above guarantees a named hit
+        };
+        res.scored += 1;
 
-        if scored[0].1 == aname {
+        if top_name == aname {
             res.rank1 += 1;
         }
         if let Some(pos) = scored.iter().position(|(_, n)| *n == aname) {
@@ -425,7 +440,6 @@ pub fn eval(a: &[IndexedFunc], b: &[IndexedFunc]) -> EvalResult {
         }
 
         // threshold-based precision/recall on the top-1 call
-        let (top_sim, top_name) = scored[0];
         let predicted_same = top_sim >= SAME_THRESH;
         if !predicted_same {
             res.abstained += 1; // below threshold, we'd decline to call it

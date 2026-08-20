@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 *.db
 bench/work/
 fuzz/target/

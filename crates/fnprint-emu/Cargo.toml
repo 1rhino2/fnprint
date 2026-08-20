@@ -11,3 +11,6 @@ unicorn-engine = { workspace = true }
 capstone = { workspace = true }
 fnprint-trace = { path = "../fnprint-trace", version = "0.2.0" }
 fnprint-loader = { path = "../fnprint-loader", version = "0.2.0" }
+
+[lints]
+workspace = true

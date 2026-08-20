@@ -13,10 +13,15 @@ emulator are written to treat every field in a file as attacker-controlled.
   result.
 - Micro-executed code runs inside unicorn with instruction, visit, time, and
   effect caps. It is emulated, not run natively, and it is bounded.
+- The real assumption: unicorn/qemu and capstone are large C libraries fed
+  attacker bytes, and qemu has a CVE history. So we assume a crafted input can
+  eventually corrupt memory inside one of them, and we contain that rather than
+  pretend it can't happen.
 
-What is not in the model: fnprint is an analysis tool, not a sandbox you should
-point at something and trust blindly on a production box. Run it where you run
-your other RE tooling.
+What is not in the model: fnprint is an analysis tool. The sandbox below makes a
+compromise of the emulator inert, it does not make the C libraries bug-free, and
+it does not turn fnprint into something you should point at a live target you
+can't afford to have the emulator crash on.
 
 ## Hardening in place
 
@@ -26,6 +31,41 @@ your other RE tooling.
   so a hostile `vaddr`/`offset`/`size` can't wrap into a panic or a bad index.
 - The loader has adversarial tests for truncated files, past-EOF offsets,
   overflowing sizes, and absurd `p_memsz`. Fuzz targets live in `fuzz/`.
+- Attacker-controlled symbol names are escaped before they are printed, so a
+  crafted name can't smuggle terminal escape sequences into your terminal.
+
+## Sandbox (Linux)
+
+The part that touches the untrusted binary runs privilege-separated. When you
+run `fnprint index/match/query/eval/triage/dump` on an ELF, the cli re-execs
+itself as a hidden worker, hands the file bytes to it over a pipe, and gets
+fingerprints back over a pipe. Before the worker reads a single input byte it
+jails itself:
+
+- `PR_SET_NO_NEW_PRIVS`, no core dumps, bounded CPU, and an `RLIMIT_AS` backstop.
+- Two stacked seccomp filters, applied to every thread (rayon and qemu spawn
+  threads, and the emulation runs on them). The catastrophic syscalls, `execve`,
+  `ptrace`, the whole socket family, module/kexec/bpf, mount/chroot/namespace,
+  the setuid family, hard-kill the process. Anything else not on a small allow
+  set fails soft with `EPERM`. So `open`/`openat` return `EPERM`: a popped worker
+  can't read a file off your disk or open a socket, but qemu's best-effort probes
+  of `/sys` and `/proc` degrade to an error instead of taking the run down.
+
+The result: a memory-corruption exploit that lands inside unicorn from a crafted
+input can still compute in its own address space, but it can't exec a shell, open
+a file, or reach the network. The trusted parent does the database and terminal
+output; it never runs the emulator.
+
+Fail-closed: if the jail won't install, the worker refuses to process input.
+`--no-sandbox` is an explicit, loud opt-out for a platform that can't jail (the
+sandbox is Linux-only) or for debugging. It runs the emulator in-process with no
+containment, so only use it when you trust the input.
+
+What the sandbox does not cover yet: reading a corpus `.db` (for `match`,
+`query`, `triage`) parses that SQLite file in the trusted parent, not in the
+jail. Treat a `.db` you did not build as untrusted input too, and don't point
+those subcommands at a corpus from someone you don't trust until that path is
+jailed as well.
 
 ## Reporting
 

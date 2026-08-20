@@ -10,3 +10,7 @@ repository.workspace = true
 anyhow = { workspace = true }
 goblin = { workspace = true }
 gimli = { workspace = true }
+serde = { workspace = true }
+
+[lints]
+workspace = true

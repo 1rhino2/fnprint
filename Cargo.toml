@@ -7,18 +7,19 @@ members = [
     "crates/fnprint-sig",
     "crates/fnprint-db",
     "crates/fnprint-core",
+    "crates/fnprint-sandbox",
     "cli",
 ]
 
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.82"
 license = "MIT"
 repository = "https://github.com/1rhino2/fnprint"
 
 [workspace.dependencies]
 anyhow = "1"
-thiserror = "1"
 goblin = "0.8"
 gimli = "0.31"
 capstone = "0.12"
@@ -27,4 +28,26 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+bincode = "1.3"
+
+# hardened release build: no unwinding into a bad state, overflow aborts instead
+# of wrapping into a bad index, and strip symbols.
+[profile.release]
+panic = "abort"
+overflow-checks = true
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# the whole workspace is unsafe-free and stays that way; the only native memory
+# lives inside the unicorn/capstone/sqlite C libs, not our code. also ban the
+# panic-macro family so no parse path can grow a panic (none exist today).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+mem_forget = "deny"

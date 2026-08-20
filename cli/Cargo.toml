@@ -20,3 +20,9 @@ fnprint-core = { path = "../crates/fnprint-core", version = "0.2.0" }
 fnprint-db = { path = "../crates/fnprint-db", version = "0.2.0" }
 fnprint-loader = { path = "../crates/fnprint-loader", version = "0.2.0" }
 fnprint-emu = { path = "../crates/fnprint-emu", version = "0.2.0" }
+fnprint-sandbox = { path = "../crates/fnprint-sandbox", version = "0.2.0" }
+serde = { workspace = true }
+bincode = { workspace = true }
+
+[lints]
+workspace = true

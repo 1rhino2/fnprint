@@ -167,9 +167,11 @@ fn encode_sig(sig: &[u64]) -> Vec<u8> {
 }
 
 fn decode_sig(bytes: &[u8]) -> Vec<u64> {
+    // chunks_exact(8) always yields 8-byte slices, so try_into never fails; use
+    // filter_map anyway so there is no unwrap on db-loaded bytes.
     bytes
         .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .filter_map(|c| c.try_into().ok().map(u64::from_le_bytes))
         .collect()
 }
 

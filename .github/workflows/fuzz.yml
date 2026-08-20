@@ -1,0 +1,48 @@
+name: fuzz
+
+# fuzzing is slow, so it runs nightly and on demand, not on every push. each
+# target runs a bounded budget under libfuzzer+ASan; a crash fails the job and
+# uploads the reproducer. this is the continuous check on the loader/emulator
+# hostile-input surface.
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [loader, index]
+    steps:
+      - uses: actions/checkout@v5
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libunicorn-dev libcapstone-dev
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: seed corpus
+        run: |
+          # a small real .so plus a few malformed variants, so the bounded run
+          # starts from realistic bytes instead of an empty corpus.
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cat > /tmp/seed.c <<'C'
+          #include <stddef.h>
+          int add(int a,int b){return a+b;}
+          size_t find_byte(const char*s,size_t n,char c){for(size_t i=0;i<n;i++)if(s[i]==c)return i;return n;}
+          int csum(const unsigned char*b,size_t n){int c=0;for(size_t i=0;i<n;i++)c=(c<<3)^b[i]^(c>>5);return c;}
+          C
+          gcc -shared -fPIC -O2 /tmp/seed.c -o fuzz/corpus/${{ matrix.target }}/real.so
+          # truncated ELF and a header-only garbage blob
+          head -c 64 fuzz/corpus/${{ matrix.target }}/real.so > fuzz/corpus/${{ matrix.target }}/truncated
+          printf '\x7fELF\x02\x01\x01' > fuzz/corpus/${{ matrix.target }}/stub
+      - name: fuzz ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=180 -rss_limit_mb=4096
+      - name: upload crash repro
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/

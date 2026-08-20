@@ -1,15 +1,38 @@
 use std::fs;
+use std::io::{Read, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use fnprint_core::{
-    dump_traces, eval, index_bytes, match_by_name, query_corpus, source_str, triage, IndexedFunc,
-    Verdict, MIN_COMPLEXITY,
+    dump_traces, eval, index_bytes, match_by_name, query_corpus, source_str, triage, warm_pool,
+    EffectTrace, IndexedFunc, Verdict, MIN_COMPLEXITY,
 };
 use fnprint_db::Db;
 use fnprint_emu::Config;
 use fnprint_loader::FuncSource;
+use serde::{Deserialize, Serialize};
+
+// hard caps on the privsep pipe so neither side can be pushed into an unbounded
+// alloc. an ELF bigger than this we refuse; a worker reply bigger than this we
+// treat as a compromised worker.
+const MAX_INPUT: u64 = 512 << 20; // 512 MiB
+const MAX_REPLY: u64 = 512 << 20;
+
+// the hidden argv token the parent re-execs itself with to become the jailed
+// worker. anything the emulator touches runs behind it.
+const WORKER_TOKEN: &str = "__worker";
+
+// what the jailed worker sends back over stdout. the parent treats every field
+// as untrusted (a popped worker can put anything here): entry addresses and
+// names are only ever printed escaped or written to the db, never used to index.
+#[derive(Serialize, Deserialize)]
+enum WorkerReply {
+    IndexOk(Vec<IndexedFunc>),
+    DumpOk(Vec<String>),
+    Err(String),
+}
 
 #[derive(Parser)]
 #[command(
@@ -18,6 +41,10 @@ use fnprint_loader::FuncSource;
     about = "behavioral function fingerprinting"
 )]
 struct Cli {
+    /// run the emulator in-process without the sandbox. unsafe: only for a
+    /// platform that can't jail, or debugging. default is always jailed.
+    #[arg(long, global = true)]
+    no_sandbox: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -61,33 +88,210 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // privsep worker entrypoint. the parent re-execs itself as
+    // `fnprint __worker <op> [func]`; the worker jails itself, reads the
+    // untrusted binary from stdin, and writes a bincode reply to stdout. we
+    // intercept it before clap so the worker protocol stays out of the cli.
+    let mut raw = std::env::args();
+    let _bin = raw.next();
+    if raw.next().as_deref() == Some(WORKER_TOKEN) {
+        let op = raw.next().unwrap_or_default();
+        let func = raw.next();
+        return worker_main(&op, func.as_deref());
+    }
+
     let cli = Cli::parse();
+    let ns = cli.no_sandbox;
     match cli.cmd {
-        Cmd::Index { binary, out } => cmd_index(&binary, out.as_deref()),
-        Cmd::Match { a, b } => cmd_match(&a, &b),
+        Cmd::Index { binary, out } => cmd_index(&binary, out.as_deref(), ns),
+        Cmd::Match { a, b } => cmd_match(&a, &b, ns),
         Cmd::Query {
             target,
             corpus,
             threshold,
-        } => cmd_query(&target, &corpus, threshold),
-        Cmd::Eval { a, b } => cmd_eval(&a, &b),
+        } => cmd_query(&target, &corpus, threshold, ns),
+        Cmd::Eval { a, b } => cmd_eval(&a, &b, ns),
         Cmd::Triage {
             target,
             vuln,
             patched,
             min_sim,
             margin,
-        } => cmd_triage(&target, &vuln, &patched, min_sim, margin),
-        Cmd::Dump { binary, func } => cmd_dump(&binary, &func),
+        } => cmd_triage(&target, &vuln, &patched, min_sim, margin, ns),
+        Cmd::Dump { binary, func } => cmd_dump(&binary, &func, ns),
     }
 }
+
+// ---- jailed worker ----------------------------------------------------------
+
+fn worker_main(op: &str, func: Option<&str>) -> Result<()> {
+    // spin up the rayon pool before we jail so the parallel index is warm and
+    // doesn't pay thread-spawn cost under the sandbox.
+    warm_thread_pool();
+
+    // fail-closed: if the jail won't install, we do not read or touch the input.
+    fnprint_sandbox::lock_down_worker().context("worker could not enter sandbox")?;
+
+    // read the untrusted binary from stdin (read is allowed inside the jail, so
+    // the worker never needs open()). bounded so a huge stdin can't OOM us.
+    let mut input = Vec::new();
+    let n = std::io::stdin()
+        .lock()
+        .take(MAX_INPUT + 1)
+        .read_to_end(&mut input)
+        .context("worker reading stdin")?;
+    if n as u64 > MAX_INPUT {
+        return emit(&WorkerReply::Err("input over size cap".into()));
+    }
+
+    // run the requested op, folding any error into the reply. this path parses
+    // and micro-executes hostile bytes, so it must never panic the process.
+    let reply = match op {
+        "index" => match index_bytes(&input, Config::default()) {
+            Ok(funcs) => WorkerReply::IndexOk(funcs),
+            Err(e) => WorkerReply::Err(format!("{e:#}")),
+        },
+        "dump" => {
+            let name = func.unwrap_or_default();
+            match dump_traces(&input, name, Config::default()) {
+                Ok(traces) => WorkerReply::DumpOk(render_traces(&traces)),
+                Err(e) => WorkerReply::Err(format!("{e:#}")),
+            }
+        }
+        other => WorkerReply::Err(format!("unknown worker op: {other}")),
+    };
+    emit(&reply)
+}
+
+fn warm_thread_pool() {
+    // touching the global pool spins up its worker threads now, pre-jail.
+    warm_pool();
+}
+
+// render the dump output to plain lines in the worker so the parent doesn't have
+// to serialize the whole effect enum. matches the old cmd_dump format exactly.
+fn render_traces(traces: &[EffectTrace]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, t) in traces.iter().enumerate() {
+        out.push(format!(
+            "-- path {} ({} effects, instret {}, capped {}) --",
+            i,
+            t.effects.len(),
+            t.instret,
+            t.capped
+        ));
+        for e in &t.effects {
+            out.push(format!("   {e:?}"));
+        }
+    }
+    out
+}
+
+fn emit(reply: &WorkerReply) -> Result<()> {
+    let buf = bincode::serialize(reply).context("serializing worker reply")?;
+    std::io::stdout()
+        .lock()
+        .write_all(&buf)
+        .context("worker writing reply")?;
+    Ok(())
+}
+
+// ---- parent side of privsep -------------------------------------------------
+
+// re-exec self as the jailed worker, hand it the bytes over stdin, read its
+// bincode reply back. the input is written on a separate thread so a large ELF
+// can't deadlock against the reply on a full pipe.
+fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply> {
+    let exe = std::env::current_exe().context("locating self for worker re-exec")?;
+    let mut cmd = Command::new(exe);
+    cmd.arg(WORKER_TOKEN).arg(op);
+    if let Some(f) = func {
+        cmd.arg(f);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = cmd.spawn().context("spawning jailed worker")?;
+
+    let mut stdin = child.stdin.take().context("worker stdin")?;
+    let payload = input.to_vec();
+    let writer = std::thread::spawn(move || {
+        // ignore the error: if the worker died early we'll see it in wait()
+        let _ = stdin.write_all(&payload);
+        drop(stdin);
+    });
+
+    let mut out = Vec::new();
+    {
+        let mut stdout = child.stdout.take().context("worker stdout")?;
+        stdout
+            .by_ref()
+            .take(MAX_REPLY + 1)
+            .read_to_end(&mut out)
+            .context("reading worker reply")?;
+    }
+    let status = child.wait().context("waiting on worker")?;
+    let _ = writer.join();
+
+    if !status.success() {
+        bail!("jailed worker exited abnormally ({status}) - likely killed by the sandbox or a crash in the emulator");
+    }
+    if out.len() as u64 > MAX_REPLY {
+        bail!("jailed worker reply over size cap");
+    }
+    let reply: WorkerReply = bincode::deserialize(&out).context("decoding worker reply")?;
+    Ok(reply)
+}
+
+// index a binary's bytes, jailed by default. --no-sandbox runs it in-process.
+fn run_index(bytes: &[u8], no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
+    if no_sandbox {
+        eprintln!("warning: --no-sandbox, running the emulator without the jail");
+        return index_bytes(bytes, Config::default());
+    }
+    match run_worker("index", None, bytes)? {
+        WorkerReply::IndexOk(funcs) => Ok(funcs),
+        WorkerReply::Err(e) => bail!("{e}"),
+        _ => bail!("worker returned the wrong reply kind for index"),
+    }
+}
+
+fn run_dump(bytes: &[u8], func: &str, no_sandbox: bool) -> Result<Vec<String>> {
+    if no_sandbox {
+        eprintln!("warning: --no-sandbox, running the emulator without the jail");
+        return Ok(render_traces(&dump_traces(bytes, func, Config::default())?));
+    }
+    match run_worker("dump", Some(func), bytes)? {
+        WorkerReply::DumpOk(lines) => Ok(lines),
+        WorkerReply::Err(e) => bail!("{e}"),
+        _ => bail!("worker returned the wrong reply kind for dump"),
+    }
+}
+
+// ---- commands ---------------------------------------------------------------
 
 fn is_db(p: &str) -> bool {
     Path::new(p).extension().map(|e| e == "db").unwrap_or(false)
 }
 
-// load an index from either an ELF or a prebuilt db
-fn load_index(path: &str) -> Result<Vec<IndexedFunc>> {
+// symbol names and labels come out of attacker-controlled ELF strings. anything
+// that isn't a plain printable ascii char gets escaped so a crafted name can't
+// smuggle terminal escape sequences (colors, cursor moves, title sets) into our
+// output. c/rust symbol names are ascii so real names print unchanged.
+fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b == b' ' || b.is_ascii_graphic() {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\x{b:02x}"));
+        }
+    }
+    out
+}
+
+// load an index from either an ELF (jailed emulation) or a prebuilt db
+fn load_index(path: &str, no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
     if is_db(path) {
         let db = Db::open(path)?;
         Ok(db
@@ -102,13 +306,13 @@ fn load_index(path: &str) -> Result<Vec<IndexedFunc>> {
             .collect())
     } else {
         let bytes = fs::read(path).with_context(|| format!("reading {path}"))?;
-        index_bytes(&bytes, Config::default())
+        run_index(&bytes, no_sandbox)
     }
 }
 
-fn cmd_index(binary: &str, out: Option<&str>) -> Result<()> {
+fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool) -> Result<()> {
     let bytes = fs::read(binary).with_context(|| format!("reading {binary}"))?;
-    let funcs = index_bytes(&bytes, Config::default())?;
+    let funcs = run_index(&bytes, no_sandbox)?;
     let label = Path::new(binary)
         .file_name()
         .and_then(|s| s.to_str())
@@ -121,7 +325,7 @@ fn cmd_index(binary: &str, out: Option<&str>) -> Result<()> {
         .count();
     println!(
         "{}: {} functions, {} named, {} with enough signal",
-        label,
+        esc(label),
         funcs.len(),
         named,
         usable
@@ -143,9 +347,9 @@ fn cmd_index(binary: &str, out: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_match(a: &str, b: &str) -> Result<()> {
-    let ia = load_index(a)?;
-    let ib = load_index(b)?;
+fn cmd_match(a: &str, b: &str, no_sandbox: bool) -> Result<()> {
+    let ia = load_index(a, no_sandbox)?;
+    let ib = load_index(b, no_sandbox)?;
     let rep = match_by_name(&ia, &ib);
 
     println!("compared {} functions present in both", rep.compared);
@@ -158,14 +362,14 @@ fn cmd_match(a: &str, b: &str) -> Result<()> {
     if !rep.changed.is_empty() {
         println!("\nchanged behavior (lowest similarity first):");
         for c in rep.changed.iter().take(40) {
-            println!("  {:>5.1}%  {}", c.similarity * 100.0, c.name);
+            println!("  {:>5.1}%  {}", c.similarity * 100.0, esc(&c.name));
         }
     }
     Ok(())
 }
 
-fn cmd_query(target: &str, corpus: &str, threshold: f64) -> Result<()> {
-    let it = load_index(target)?;
+fn cmd_query(target: &str, corpus: &str, threshold: f64, no_sandbox: bool) -> Result<()> {
+    let it = load_index(target, no_sandbox)?;
     let db = Db::open(corpus).with_context(|| format!("opening corpus {corpus}"))?;
     let named = query_corpus(&it, &db, threshold)?;
 
@@ -182,16 +386,16 @@ fn cmd_query(target: &str, corpus: &str, threshold: f64) -> Result<()> {
             "  {:#010x}  {:>5.1}%  {}  ({})",
             n.entry,
             n.similarity * 100.0,
-            n.guess,
-            n.from_binary
+            esc(&n.guess),
+            esc(&n.from_binary)
         );
     }
     Ok(())
 }
 
-fn cmd_eval(a: &str, b: &str) -> Result<()> {
-    let ia = load_index(a)?;
-    let ib = load_index(b)?;
+fn cmd_eval(a: &str, b: &str, no_sandbox: bool) -> Result<()> {
+    let ia = load_index(a, no_sandbox)?;
+    let ib = load_index(b, no_sandbox)?;
     let r = eval(&ia, &ib);
     println!("scored {} functions (had signal + a twin in B)", r.scored);
     println!("  rank-1 accuracy: {:.1}%", r.rank1_acc() * 100.0);
@@ -214,8 +418,15 @@ fn cmd_eval(a: &str, b: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_triage(target: &str, vuln: &str, patched: &str, min_sim: f64, margin: f64) -> Result<()> {
-    let it = load_index(target)?;
+fn cmd_triage(
+    target: &str,
+    vuln: &str,
+    patched: &str,
+    min_sim: f64,
+    margin: f64,
+    no_sandbox: bool,
+) -> Result<()> {
+    let it = load_index(target, no_sandbox)?;
     let vdb = Db::open(vuln).with_context(|| format!("opening vuln corpus {vuln}"))?;
     let pdb = Db::open(patched).with_context(|| format!("opening patched corpus {patched}"))?;
     let hits = triage(&it, &vdb, &pdb, min_sim, margin)?;
@@ -250,27 +461,36 @@ fn cmd_triage(target: &str, vuln: &str, patched: &str, min_sim: f64, margin: f64
             h.vuln_sim * 100.0,
             h.patched_sim * 100.0,
             h.margin() * 100.0,
-            h.vuln_name,
-            h.patched_name,
+            esc(&h.vuln_name),
+            esc(&h.patched_name),
         );
     }
     Ok(())
 }
 
-fn cmd_dump(binary: &str, func: &str) -> Result<()> {
-    let bytes = std::fs::read(binary)?;
-    let traces = dump_traces(&bytes, func, fnprint_emu::Config::default())?;
-    for (i, t) in traces.iter().enumerate() {
-        println!(
-            "-- path {} ({} effects, instret {}, capped {}) --",
-            i,
-            t.effects.len(),
-            t.instret,
-            t.capped
-        );
-        for e in &t.effects {
-            println!("   {:?}", e);
-        }
+fn cmd_dump(binary: &str, func: &str, no_sandbox: bool) -> Result<()> {
+    let bytes = fs::read(binary).with_context(|| format!("reading {binary}"))?;
+    let lines = run_dump(&bytes, func, no_sandbox)?;
+    for line in &lines {
+        println!("{}", esc(line));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::esc;
+
+    #[test]
+    fn esc_defangs_terminal_escapes() {
+        // an ansi color escape in a crafted symbol name must not survive: the
+        // ESC byte becomes literal text so the terminal can't interpret it
+        assert_eq!(esc("foo\x1b[31mbar"), "foo\\x1b[31mbar");
+        // newline / carriage return escaped so a name can't spoof lines
+        assert_eq!(esc("a\nb\r"), "a\\x0ab\\x0d");
+        // plain ascii names pass through unchanged
+        assert_eq!(esc("adler32_z"), "adler32_z");
+        // non-ascii bytes escaped per byte
+        assert_eq!(esc("é"), "\\xc3\\xa9");
+    }
 }

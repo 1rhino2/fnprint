@@ -1,0 +1,4 @@
+# full RELRO on the linked binary (rust defaults to partial). the process that
+# eats untrusted binaries should have its GOT locked read-only after startup.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,-z,relro,-z,now"]

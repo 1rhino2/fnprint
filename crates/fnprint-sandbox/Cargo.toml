@@ -1,0 +1,24 @@
+[package]
+name = "fnprint-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "seccomp + rlimit process jail for fnprint's untrusted worker"
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+rustix = { version = "0.38", features = ["process", "thread"] }
+libc = "0.2"
+
+# the jail self-test (tests/jail.rs) drives the jailbreak_probe bin and checks
+# the kill signal, so it needs the SIGSYS constant.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

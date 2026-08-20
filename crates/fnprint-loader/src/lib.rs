@@ -23,7 +23,7 @@ pub struct Func {
     pub source: FuncSource,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FuncSource {
     Symtab,
     DynSym,
@@ -105,14 +105,20 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
             bail!("total PT_LOAD memory over {}-byte limit", MAX_TOTAL_MEM);
         }
 
-        // clamp the file window: p_offset past EOF must not slice-panic
-        let start = (ph.p_offset as usize).min(bytes.len());
-        let fsz = ph.p_filesz as usize;
+        // clamp the file window: p_offset past EOF must not slice-panic. try_from
+        // so a value too big for usize (32-bit target) clamps to EOF instead of
+        // truncating past the .min() guard.
+        let start = usize::try_from(ph.p_offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let fsz = usize::try_from(ph.p_filesz).unwrap_or(usize::MAX);
         let end = start.saturating_add(fsz).min(bytes.len());
         let mut data = bytes[start..end].to_vec();
-        // bss: memsz > filesz, pad with zeros so reads there are defined
-        if (ph.p_memsz as usize) > data.len() {
-            data.resize(ph.p_memsz as usize, 0);
+        // bss: memsz > filesz, pad with zeros so reads there are defined.
+        // p_memsz is already capped under MAX_SEG_MEM above, so it fits usize.
+        let memsz = usize::try_from(ph.p_memsz).unwrap_or(usize::MAX);
+        if memsz > data.len() {
+            data.resize(memsz, 0);
         }
         segments.push(Segment {
             vaddr: ph.p_vaddr,
@@ -193,10 +199,12 @@ fn eh_frame_funcs(elf: &Elf, raw: &[u8]) -> Option<Vec<Func>> {
         .section_headers
         .iter()
         .find(|s| elf.shdr_strtab.get_at(s.sh_name) == Some(".eh_frame"))?;
-    // sh_offset/sh_size are attacker-controlled, checked_add so a crafted size
-    // can't overflow the range and panic; get() handles past-EOF as None.
-    let start = sh.sh_offset as usize;
-    let end = start.checked_add(sh.sh_size as usize)?;
+    // sh_offset/sh_size are attacker-controlled. try_from (None if too big for
+    // usize) + checked_add so a crafted size can't overflow the range and
+    // panic; get() handles past-EOF as None.
+    let start = usize::try_from(sh.sh_offset).ok()?;
+    let size = usize::try_from(sh.sh_size).ok()?;
+    let end = start.checked_add(size)?;
     let data = raw.get(start..end)?;
 
     let eh = EhFrame::new(data, LittleEndian);
