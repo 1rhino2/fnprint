@@ -4,8 +4,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fnprint_core::{
-    dump_traces, eval, index_bytes, match_by_name, query_corpus, source_str, IndexedFunc,
-    MIN_COMPLEXITY,
+    dump_traces, eval, index_bytes, match_by_name, query_corpus, source_str, triage, IndexedFunc,
+    Verdict, MIN_COMPLEXITY,
 };
 use fnprint_db::Db;
 use fnprint_emu::Config;
@@ -42,6 +42,20 @@ enum Cmd {
     },
     /// accuracy metrics between two builds, using symbol names as ground truth
     Eval { a: String, b: String },
+    /// n-day triage: rank a target against known-vulnerable and patched corpora
+    Triage {
+        target: String,
+        #[arg(long)]
+        vuln: String,
+        #[arg(long)]
+        patched: String,
+        /// a side has to be at least this similar to count as a real lead
+        #[arg(long, default_value_t = 0.6)]
+        min_sim: f64,
+        /// how far the two sides must separate before we commit to a verdict
+        #[arg(long, default_value_t = 0.08)]
+        margin: f64,
+    },
     /// print the recorded effect trace for one function (debugging)
     Dump { binary: String, func: String },
 }
@@ -57,6 +71,13 @@ fn main() -> Result<()> {
             threshold,
         } => cmd_query(&target, &corpus, threshold),
         Cmd::Eval { a, b } => cmd_eval(&a, &b),
+        Cmd::Triage {
+            target,
+            vuln,
+            patched,
+            min_sim,
+            margin,
+        } => cmd_triage(&target, &vuln, &patched, min_sim, margin),
         Cmd::Dump { binary, func } => cmd_dump(&binary, &func),
     }
 }
@@ -174,6 +195,8 @@ fn cmd_eval(a: &str, b: &str) -> Result<()> {
     let r = eval(&ia, &ib);
     println!("scored {} functions (had signal + a twin in B)", r.scored);
     println!("  rank-1 accuracy: {:.1}%", r.rank1_acc() * 100.0);
+    println!("  recall@3:        {:.1}%", r.recall_at(3) * 100.0);
+    println!("  recall@5:        {:.1}%", r.recall_at(5) * 100.0);
     println!("  MRR:             {:.3}", r.mrr());
     println!(
         "  precision@same:  {:.1}%  ({} tp / {} fp)",
@@ -182,6 +205,59 @@ fn cmd_eval(a: &str, b: &str) -> Result<()> {
         r.fp
     );
     println!("  recall@same:     {:.1}%", r.recall() * 100.0);
+    println!(
+        "  abstained:       {:.1}%  ({} of {} below same-threshold)",
+        r.abstain_rate() * 100.0,
+        r.abstained,
+        r.scored
+    );
+    Ok(())
+}
+
+fn cmd_triage(
+    target: &str,
+    vuln: &str,
+    patched: &str,
+    min_sim: f64,
+    margin: f64,
+) -> Result<()> {
+    let it = load_index(target)?;
+    let vdb = Db::open(vuln).with_context(|| format!("opening vuln corpus {vuln}"))?;
+    let pdb = Db::open(patched).with_context(|| format!("opening patched corpus {patched}"))?;
+    let hits = triage(&it, &vdb, &pdb, min_sim, margin)?;
+
+    let vulns: Vec<_> = hits
+        .iter()
+        .filter(|h| h.verdict == Verdict::Vulnerable)
+        .collect();
+    println!(
+        "{} functions triaged: {} look vulnerable, {} patched, {} inconclusive",
+        hits.len(),
+        vulns.len(),
+        hits.iter().filter(|h| h.verdict == Verdict::Patched).count(),
+        hits.iter()
+            .filter(|h| h.verdict == Verdict::Inconclusive)
+            .count(),
+    );
+
+    if vulns.is_empty() {
+        println!("\nno function leans vulnerable above the margin. nothing to review.");
+        return Ok(());
+    }
+    // the review queue: strongest vulnerable lead first
+    println!("\nreview queue (vuln-leaning, strongest first):");
+    println!("   addr         vuln%  patched%  margin  matches");
+    for h in vulns {
+        println!(
+            "   {:#010x}  {:>5.1}   {:>6.1}   {:>+5.1}  {} vs {}",
+            h.entry,
+            h.vuln_sim * 100.0,
+            h.patched_sim * 100.0,
+            h.margin() * 100.0,
+            h.vuln_name,
+            h.patched_name,
+        );
+    }
     Ok(())
 }
 

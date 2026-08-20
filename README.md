@@ -54,6 +54,27 @@ changed behavior (lowest similarity first):
    61.7%  deflate_stored
 ```
 
+for actual n-day work there is `triage`. build one corpus from the known
+vulnerable version of a function and one from the patched version, then rank an
+unknown build against both. a function close to the vulnerable side and clearly
+separated from the patched side is what you want in front of a human, not just a
+single match score you have to interpret:
+
+```
+$ fnprint index vuln.so    -o vuln.db
+$ fnprint index patched.so -o patched.db
+$ fnprint triage mystery.so --vuln vuln.db --patched patched.db
+43 functions triaged: 1 look vulnerable, 0 patched, 42 inconclusive
+
+review queue (vuln-leaning, strongest first):
+   addr         vuln%  patched%  margin  matches
+   0x000022f9  100.0     27.3   +72.7  adler32_z vs crc32_z
+```
+
+the 42 functions that are identical in both versions come back inconclusive on
+purpose, they can't be pinned to either side and shouldn't be flagged. `--margin`
+and `--min-sim` control how hard the two sides have to separate before it commits.
+
 ## how it works
 
 for each function:
@@ -96,6 +117,7 @@ cargo build --release   # binary at target/release/fnprint
 fnprint index <binary> [-o out.db]      fingerprint every function, optionally to a db
 fnprint match <a> <b>                   diff two binaries (or .db files) by behavior
 fnprint query <target> --corpus <db>    name unknown functions from a corpus
+fnprint triage <t> --vuln <db> --patched <db>   rank a build against vuln vs patched corpora
 fnprint eval <a> <b>                     accuracy metrics using symbol names as truth
 fnprint dump <binary> <func>            print the recorded effect trace (debugging)
 ```
@@ -119,6 +141,13 @@ task. measured on zlib 1.3.1 (84 functions), reproducible with `bench/run.sh`:
 | gcc/clang O2    | 59.1%  | 50.0%     |
 
 full table plus a second library (lua) in [bench/NUMBERS.md](bench/NUMBERS.md).
+
+`eval` also reports recall@3 / recall@5 and an abstention rate, since rank-1
+alone hides a lot. on gcc O0 -> O2 the top hit is right 93% of the time but the
+correct function is in the top 5 96.6% of the time, so a small review budget
+closes most of the gap. it also abstains (declines a confident "same" call)
+on the pairs it isn't sure about instead of guessing, which is why precision
+stays high while recall at the same threshold is low.
 
 the honest read: when at least one side has some behavioral richness (anything
 with `-O0`/`-O1`, or a cross-compiler pair at `-O0`) it lands in the 80-98%

@@ -158,6 +158,33 @@ pub struct Named {
     pub similarity: f64,
 }
 
+/// best-scoring named function in a corpus for one print. narrows with the LSH
+/// bands first and falls back to the full set if no band hit. returns
+/// (similarity, name, binary). the preloaded `all` is the fallback pool.
+fn best_in_corpus(
+    fp: &Fingerprint,
+    db: &Db,
+    all: &[fnprint_db::FuncRec],
+) -> Result<Option<(f64, String, String)>> {
+    let cands = db.candidates(fp)?;
+    let pool: &[fnprint_db::FuncRec] = if cands.is_empty() { all } else { &cands };
+    let mut best: Option<(f64, String, String)> = None;
+    for c in pool {
+        if c.fp.complexity < MIN_COMPLEXITY {
+            continue;
+        }
+        let cname = match &c.name {
+            Some(n) => n,
+            None => continue,
+        };
+        let sim = fp.similarity(&c.fp);
+        if best.as_ref().map(|(s, _, _)| sim > *s).unwrap_or(true) {
+            best = Some((sim, cname.clone(), c.binary.clone()));
+        }
+    }
+    Ok(best)
+}
+
 /// for each function in the target that we can trust, pull the best-matching
 /// named function out of the corpus db. withholds tiny/low-signal functions.
 pub fn query_corpus(target: &[IndexedFunc], corpus: &Db, threshold: f64) -> Result<Vec<Named>> {
@@ -167,35 +194,112 @@ pub fn query_corpus(target: &[IndexedFunc], corpus: &Db, threshold: f64) -> Resu
         if f.fp.complexity < MIN_COMPLEXITY || f.fp.shingles == 0 {
             continue;
         }
-        // narrow with LSH, then score
-        let cands = corpus.candidates(&f.fp)?;
-        let pool = if cands.is_empty() { &named } else { &cands };
-        let mut best: Option<(f64, &str, &str)> = None;
-        for c in pool {
-            if c.fp.complexity < MIN_COMPLEXITY {
-                continue;
-            }
-            let sim = f.fp.similarity(&c.fp);
-            let cname = match &c.name {
-                Some(n) => n.as_str(),
-                None => continue,
-            };
-            if best.map(|(s, _, _)| sim > s).unwrap_or(true) {
-                best = Some((sim, cname, c.binary.as_str()));
-            }
-        }
-        if let Some((sim, name, bin)) = best {
+        if let Some((sim, name, bin)) = best_in_corpus(&f.fp, corpus, &named)? {
             if sim >= threshold {
                 out.push(Named {
                     entry: f.entry,
-                    guess: name.to_string(),
-                    from_binary: bin.to_string(),
+                    guess: name,
+                    from_binary: bin,
                     similarity: sim,
                 });
             }
         }
     }
     out.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    Ok(out)
+}
+
+// -------- triage (n-day: vulnerable vs patched, the actionable view) --------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    /// leans toward the known-vulnerable version, clear of the patched one
+    Vulnerable,
+    /// leans toward the patched version
+    Patched,
+    /// neither side is close enough, or the two are too close to separate
+    Inconclusive,
+}
+
+pub struct TriageHit {
+    pub entry: u64,
+    pub verdict: Verdict,
+    pub vuln_sim: f64,
+    pub vuln_name: String,
+    pub patched_sim: f64,
+    pub patched_name: String,
+}
+
+impl TriageHit {
+    /// how far the vulnerable side leads the patched side. negative means it
+    /// looks patched. this is the separation the reviewer actually cares about.
+    pub fn margin(&self) -> f64 {
+        self.vuln_sim - self.patched_sim
+    }
+}
+
+fn verdict_order(v: Verdict) -> u8 {
+    // vulnerable-leaning to the top of the review queue, patched to the bottom
+    match v {
+        Verdict::Vulnerable => 0,
+        Verdict::Inconclusive => 1,
+        Verdict::Patched => 2,
+    }
+}
+
+/// rank each target function against a known-vulnerable corpus and a known-patched
+/// corpus and call which side it leans to. a function close to the vulnerable
+/// version and clearly separated from the patched one is a candidate worth a
+/// human's time, which is more useful for n-day work than a single match score.
+///
+/// `min_sim`: a side has to be at least this similar to count as a real lead.
+/// `margin`: how far the two sides must separate before we commit to a verdict.
+/// the result is sorted as a review queue, strongest vulnerable lead first.
+pub fn triage(
+    target: &[IndexedFunc],
+    vuln: &Db,
+    patched: &Db,
+    min_sim: f64,
+    margin: f64,
+) -> Result<Vec<TriageHit>> {
+    let vuln_all = vuln.all()?;
+    let patched_all = patched.all()?;
+    let mut out = Vec::new();
+    for f in target {
+        if f.fp.complexity < MIN_COMPLEXITY || f.fp.shingles == 0 {
+            continue;
+        }
+        let (vuln_sim, vuln_name) = best_in_corpus(&f.fp, vuln, &vuln_all)?
+            .map(|(s, n, _)| (s, n))
+            .unwrap_or((0.0, String::new()));
+        let (patched_sim, patched_name) = best_in_corpus(&f.fp, patched, &patched_all)?
+            .map(|(s, n, _)| (s, n))
+            .unwrap_or((0.0, String::new()));
+
+        let top = vuln_sim.max(patched_sim);
+        let verdict = if top < min_sim {
+            Verdict::Inconclusive
+        } else if vuln_sim - patched_sim >= margin {
+            Verdict::Vulnerable
+        } else if patched_sim - vuln_sim >= margin {
+            Verdict::Patched
+        } else {
+            Verdict::Inconclusive
+        };
+        out.push(TriageHit {
+            entry: f.entry,
+            verdict,
+            vuln_sim,
+            vuln_name,
+            patched_sim,
+            patched_name,
+        });
+    }
+    out.sort_by(|a, b| {
+        verdict_order(a.verdict)
+            .cmp(&verdict_order(b.verdict))
+            .then(b.vuln_sim.partial_cmp(&a.vuln_sim).unwrap())
+    });
     Ok(out)
 }
 
@@ -213,6 +317,12 @@ pub struct EvalResult {
     pub fp: usize,
     /// same-named pairs we failed to call same
     pub fn_: usize,
+    /// 1-based rank of the correct match for each scored function. lets us ask
+    /// "does reviewing the top k candidates find it", not just the top-1 number.
+    pub ranks: Vec<usize>,
+    /// scored functions where the top-1 similarity was below SAME_THRESH, i.e.
+    /// the tool would decline to make a confident call rather than guess.
+    pub abstained: usize,
 }
 
 impl EvalResult {
@@ -246,6 +356,24 @@ impl EvalResult {
             self.tp as f64 / d as f64
         }
     }
+    /// fraction of scored functions whose correct match lands in the top k.
+    /// recall@5 answers "if an analyst looks at 5 candidates, do they find it".
+    pub fn recall_at(&self, k: usize) -> f64 {
+        if self.scored == 0 {
+            return 0.0;
+        }
+        let hits = self.ranks.iter().filter(|&&r| r <= k).count();
+        hits as f64 / self.scored as f64
+    }
+    /// how often the tool declined a confident top-1 call. high abstention with
+    /// high precision is the honest tradeoff: quiet when it isn't sure.
+    pub fn abstain_rate(&self) -> f64 {
+        if self.scored == 0 {
+            0.0
+        } else {
+            self.abstained as f64 / self.scored as f64
+        }
+    }
 }
 
 /// rank every signal-bearing function in A against all of B, using symbol names
@@ -263,6 +391,8 @@ pub fn eval(a: &[IndexedFunc], b: &[IndexedFunc]) -> EvalResult {
         tp: 0,
         fp: 0,
         fn_: 0,
+        ranks: Vec::new(),
+        abstained: 0,
     };
 
     for fa in a {
@@ -291,11 +421,15 @@ pub fn eval(a: &[IndexedFunc], b: &[IndexedFunc]) -> EvalResult {
         }
         if let Some(pos) = scored.iter().position(|(_, n)| *n == aname) {
             res.rr_sum += 1.0 / (pos as f64 + 1.0);
+            res.ranks.push(pos + 1); // 1-based rank for recall@k
         }
 
         // threshold-based precision/recall on the top-1 call
         let (top_sim, top_name) = scored[0];
         let predicted_same = top_sim >= SAME_THRESH;
+        if !predicted_same {
+            res.abstained += 1; // below threshold, we'd decline to call it
+        }
         let correct = top_name == aname;
         match (predicted_same, correct) {
             (true, true) => res.tp += 1,
@@ -379,5 +513,41 @@ mod tests {
         let rep = match_by_name(&a, &b);
         assert_eq!(rep.changed.len(), 0);
         assert_eq!(rep.low_signal, 1);
+    }
+
+    #[test]
+    fn triage_leans_to_matching_side() {
+        // vuln corpus holds the function at seed 3, patched holds it at seed 999.
+        // a target that behaves like seed 3 must come back Vulnerable, and one
+        // like seed 999 must come back Patched.
+        let vuln = Db::open_memory().unwrap();
+        vuln.insert("v1", Some("f"), 0x1000, "symtab", &ifunc("f", 3, 10).fp)
+            .unwrap();
+        let patched = Db::open_memory().unwrap();
+        patched
+            .insert("v2", Some("f"), 0x1000, "symtab", &ifunc("f", 999, 10).fp)
+            .unwrap();
+
+        let looks_vuln = triage(&[ifunc("x", 3, 10)], &vuln, &patched, 0.5, 0.1).unwrap();
+        assert_eq!(looks_vuln[0].verdict, Verdict::Vulnerable);
+        assert!(looks_vuln[0].margin() > 0.0);
+
+        let looks_patched = triage(&[ifunc("x", 999, 10)], &vuln, &patched, 0.5, 0.1).unwrap();
+        assert_eq!(looks_patched[0].verdict, Verdict::Patched);
+    }
+
+    #[test]
+    fn triage_abstains_when_nothing_close() {
+        // target matches neither side -> below min_sim -> Inconclusive
+        let vuln = Db::open_memory().unwrap();
+        vuln.insert("v1", Some("f"), 0x1000, "symtab", &ifunc("f", 3, 10).fp)
+            .unwrap();
+        let patched = Db::open_memory().unwrap();
+        patched
+            .insert("v2", Some("f"), 0x1000, "symtab", &ifunc("f", 999, 10).fp)
+            .unwrap();
+
+        let hits = triage(&[ifunc("x", 55555, 10)], &vuln, &patched, 0.9, 0.1).unwrap();
+        assert_eq!(hits[0].verdict, Verdict::Inconclusive);
     }
 }
