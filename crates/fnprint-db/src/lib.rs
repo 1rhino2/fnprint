@@ -3,11 +3,15 @@
 
 use anyhow::Result;
 use fnprint_sig::{Fingerprint, SIG_LEN};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 // b bands of r rows. b*r must equal SIG_LEN.
 pub const BAND_ROWS: usize = 4;
 pub const BANDS: usize = SIG_LEN / BAND_ROWS;
+// every legit signature is exactly SIG_LEN u64s. a stored blob of any other
+// size is corrupt or crafted, so we never select or decode it. this also caps
+// how big a blob a malicious corpus db can make us allocate.
+const SIG_BYTES: i64 = (SIG_LEN * 8) as i64;
 
 pub struct Db {
     pub conn: Connection,
@@ -93,9 +97,10 @@ impl Db {
 
     pub fn all(&self) -> Result<Vec<FuncRec>> {
         let mut st = self.conn.prepare(
-            "SELECT id,binary,name,entry,source,complexity,shingles,capped,sig FROM funcs",
+            "SELECT id,binary,name,entry,source,complexity,shingles,capped,sig
+             FROM funcs WHERE length(sig)=?1",
         )?;
-        let rows = st.query_map([], |r| Ok(row_to_rec(r)))?;
+        let rows = st.query_map(params![SIG_BYTES], |r| Ok(row_to_rec(r)))?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r??);
@@ -118,10 +123,18 @@ impl Db {
         let mut out = Vec::new();
         for id in ids {
             let mut st = self.conn.prepare(
-                "SELECT id,binary,name,entry,source,complexity,shingles,capped,sig FROM funcs WHERE id=?1",
+                "SELECT id,binary,name,entry,source,complexity,shingles,capped,sig
+                 FROM funcs WHERE id=?1 AND length(sig)=?2",
             )?;
-            let rec = st.query_row(params![id], |r| Ok(row_to_rec(r)))??;
-            out.push(rec);
+            // a band pointing at a missing or wrong-sized row (corrupt/crafted
+            // db) is skipped, not a hard error that kills the whole query.
+            match st
+                .query_row(params![id, SIG_BYTES], |r| Ok(row_to_rec(r)))
+                .optional()?
+            {
+                Some(rec) => out.push(rec?),
+                None => continue,
+            }
         }
         Ok(out)
     }
@@ -185,5 +198,36 @@ mod tests {
         // querying with foo's own print must surface foo as a candidate
         let cands = db.candidates(&fp(0)).unwrap();
         assert!(cands.iter().any(|c| c.name.as_deref() == Some("foo")));
+    }
+
+    #[test]
+    fn corrupt_sig_row_is_skipped_not_fatal() {
+        let db = Db::open_memory().unwrap();
+        db.insert("a.bin", Some("good"), 0x1000, "symtab", &fp(0))
+            .unwrap();
+        // craft a row with a wrong-sized sig blob, like a corrupt or malicious
+        // corpus would have. it must be skipped, and it must not make us try to
+        // decode a giant blob or blow up the query.
+        db.conn
+            .execute(
+                "INSERT INTO funcs(binary,name,entry,source,complexity,shingles,capped,sig)
+                 VALUES('evil.bin','bad',0x2000,'symtab',5,10,0,?1)",
+                params![vec![0u8; 7]], // not a multiple of 8, and not SIG_BYTES
+            )
+            .unwrap();
+        // also a plausible-but-oversized blob
+        db.conn
+            .execute(
+                "INSERT INTO funcs(binary,name,entry,source,complexity,shingles,capped,sig)
+                 VALUES('evil.bin','huge',0x3000,'symtab',5,10,0,?1)",
+                params![vec![0u8; SIG_BYTES as usize * 4]],
+            )
+            .unwrap();
+
+        let all = db.all().unwrap();
+        assert_eq!(all.len(), 1, "only the well-formed row should load");
+        assert_eq!(all[0].name.as_deref(), Some("good"));
+        // candidate lookup must not error out on the corrupt rows either
+        let _ = db.candidates(&fp(0)).unwrap();
     }
 }

@@ -37,13 +37,23 @@ pub struct Image {
 }
 
 impl Image {
-    /// grab the code bytes for a function out of the mapped segments
+    /// grab the code bytes for a function out of the mapped segments.
+    /// vaddr/len come from attacker-controlled headers, so every bound is
+    /// checked without ever doing arithmetic that can wrap.
     pub fn code_at(&self, vaddr: u64, len: usize) -> Option<&[u8]> {
+        let len = len as u64;
         for s in &self.segments {
-            if vaddr >= s.vaddr && vaddr + len as u64 <= s.vaddr + s.bytes.len() as u64 {
-                let off = (vaddr - s.vaddr) as usize;
-                return Some(&s.bytes[off..off + len]);
+            if vaddr < s.vaddr {
+                continue;
             }
+            let off = vaddr - s.vaddr; // safe: vaddr >= s.vaddr
+            let seg_len = s.bytes.len() as u64;
+            // off + len must fit inside the segment, no overflow
+            if off.checked_add(len).is_none_or(|end| end > seg_len) {
+                continue;
+            }
+            let off = off as usize;
+            return Some(&s.bytes[off..off + len as usize]);
         }
         None
     }
@@ -53,6 +63,14 @@ pub struct Loaded {
     pub image: Image,
     pub funcs: Vec<Func>,
 }
+
+/// a single PT_LOAD bigger than this is refused rather than allocated. real RE
+/// targets, firmware included, sit well under it; anything past it is a crafted
+/// header trying to make us allocate our way into an OOM.
+const MAX_SEG_MEM: u64 = 1 << 31; // 2 GiB
+/// total mapped memory across all segments, same idea, bounds a fan-out of many
+/// medium segments that each pass the per-segment check.
+const MAX_TOTAL_MEM: u64 = 1 << 32; // 4 GiB
 
 pub fn load(bytes: &[u8]) -> Result<Loaded> {
     let elf = Elf::parse(bytes).context("not a valid elf")?;
@@ -64,11 +82,31 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
     }
 
     let mut segments = Vec::new();
+    let mut total_mem: u64 = 0;
     for ph in &elf.program_headers {
         if ph.p_type != goblin::elf::program_header::PT_LOAD {
             continue;
         }
-        let start = ph.p_offset as usize;
+        // refuse a bss claim we won't allocate for (loader bomb)
+        if ph.p_memsz > MAX_SEG_MEM {
+            bail!(
+                "PT_LOAD p_memsz {} over {}-byte limit, refusing",
+                ph.p_memsz,
+                MAX_SEG_MEM
+            );
+        }
+        // a vaddr+memsz that wraps u64 is nonsense and would overflow the
+        // page math downstream, reject it here at the boundary.
+        if ph.p_vaddr.checked_add(ph.p_memsz).is_none() {
+            bail!("PT_LOAD vaddr {:#x} + memsz overflows", ph.p_vaddr);
+        }
+        total_mem = total_mem.saturating_add(ph.p_memsz);
+        if total_mem > MAX_TOTAL_MEM {
+            bail!("total PT_LOAD memory over {}-byte limit", MAX_TOTAL_MEM);
+        }
+
+        // clamp the file window: p_offset past EOF must not slice-panic
+        let start = (ph.p_offset as usize).min(bytes.len());
         let fsz = ph.p_filesz as usize;
         let end = start.saturating_add(fsz).min(bytes.len());
         let mut data = bytes[start..end].to_vec();
@@ -155,8 +193,11 @@ fn eh_frame_funcs(elf: &Elf, raw: &[u8]) -> Option<Vec<Func>> {
         .section_headers
         .iter()
         .find(|s| elf.shdr_strtab.get_at(s.sh_name) == Some(".eh_frame"))?;
+    // sh_offset/sh_size are attacker-controlled, checked_add so a crafted size
+    // can't overflow the range and panic; get() handles past-EOF as None.
     let start = sh.sh_offset as usize;
-    let data = raw.get(start..start + sh.sh_size as usize)?;
+    let end = start.checked_add(sh.sh_size as usize)?;
+    let data = raw.get(start..end)?;
 
     let eh = EhFrame::new(data, LittleEndian);
     let bases = BaseAddresses::default().set_eh_frame(sh.sh_addr);
@@ -210,5 +251,80 @@ mod tests {
         let mut hdr = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
         hdr.extend(std::iter::repeat_n(0u8, 48));
         let _ = load(&hdr);
+    }
+
+    // minimal ELF64 x86-64 with exactly one PT_LOAD, so we can craft hostile
+    // program-header fields and prove the loader refuses them instead of
+    // panicking or allocating its way into an OOM.
+    fn craft_elf(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64) -> Vec<u8> {
+        let mut e = vec![0u8; 64 + 56];
+        e[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        e[4] = 2; // ELFCLASS64
+        e[5] = 1; // ELFDATA2LSB
+        e[6] = 1; // EV_CURRENT
+        let put16 =
+            |e: &mut [u8], off: usize, v: u16| e[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |e: &mut [u8], off: usize, v: u32| e[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |e: &mut [u8], off: usize, v: u64| e[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        put16(&mut e, 16, 2); // e_type ET_EXEC
+        put16(&mut e, 18, 62); // e_machine EM_X86_64
+        put32(&mut e, 20, 1); // e_version
+        put64(&mut e, 32, 64); // e_phoff, header is 64 bytes
+        put16(&mut e, 52, 64); // e_ehsize
+        put16(&mut e, 54, 56); // e_phentsize
+        put16(&mut e, 56, 1); // e_phnum
+                              // program header at offset 64
+        let ph = 64;
+        put32(&mut e, ph, 1); // p_type PT_LOAD
+        put32(&mut e, ph + 4, 5); // p_flags R+X
+        put64(&mut e, ph + 8, p_offset);
+        put64(&mut e, ph + 16, p_vaddr);
+        put64(&mut e, ph + 32, p_filesz);
+        put64(&mut e, ph + 40, p_memsz);
+        put64(&mut e, ph + 48, 0x1000); // p_align
+        e
+    }
+
+    #[test]
+    fn huge_memsz_is_refused_not_allocated() {
+        // p_memsz near u64::MAX must error, never try to allocate ~16 EiB
+        let elf = craft_elf(0, 0x1000, 0, u64::MAX);
+        assert!(load(&elf).is_err());
+        // just over the cap is refused too
+        let elf = craft_elf(0, 0x1000, 0, MAX_SEG_MEM + 1);
+        assert!(load(&elf).is_err());
+    }
+
+    #[test]
+    fn vaddr_plus_memsz_overflow_is_refused() {
+        let elf = craft_elf(0, u64::MAX - 16, 0, 4096);
+        assert!(load(&elf).is_err());
+    }
+
+    #[test]
+    fn offset_past_eof_does_not_panic() {
+        // p_offset way past the file end must clamp, not slice-panic
+        let elf = craft_elf(0xffff_0000, 0x1000, 32, 32);
+        let _ = load(&elf); // Err or Ok, never a panic
+    }
+
+    #[test]
+    fn code_at_high_vaddr_no_overflow() {
+        // a segment near the top of the address space, then a read whose
+        // vaddr+len would wrap: must return None, not panic
+        let img = Image {
+            segments: vec![Segment {
+                vaddr: u64::MAX - 8,
+                bytes: vec![0u8; 8],
+                exec: true,
+                write: false,
+            }],
+            entry: 0,
+            is_pie: false,
+        };
+        assert!(img.code_at(u64::MAX - 4, 64).is_none());
+        assert!(img.code_at(u64::MAX, 16).is_none());
     }
 }

@@ -143,7 +143,7 @@ pub fn match_by_name(a: &[IndexedFunc], b: &[IndexedFunc]) -> MatchReport {
         }
     }
     rep.changed
-        .sort_by(|x, y| x.similarity.partial_cmp(&y.similarity).unwrap());
+        .sort_by(|x, y| x.similarity.total_cmp(&y.similarity));
     rep.only_a.sort();
     rep.only_b.sort();
     rep
@@ -205,7 +205,7 @@ pub fn query_corpus(target: &[IndexedFunc], corpus: &Db, threshold: f64) -> Resu
             }
         }
     }
-    out.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    out.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
     Ok(out)
 }
 
@@ -298,7 +298,7 @@ pub fn triage(
     out.sort_by(|a, b| {
         verdict_order(a.verdict)
             .cmp(&verdict_order(b.verdict))
-            .then(b.vuln_sim.partial_cmp(&a.vuln_sim).unwrap())
+            .then(b.vuln_sim.total_cmp(&a.vuln_sim))
     });
     Ok(out)
 }
@@ -414,7 +414,7 @@ pub fn eval(a: &[IndexedFunc], b: &[IndexedFunc]) -> EvalResult {
             .iter()
             .map(|f| (fa.fp.similarity(&f.fp), f.name.as_deref().unwrap()))
             .collect();
-        scored.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
+        scored.sort_by(|x, y| y.0.total_cmp(&x.0));
 
         if scored[0].1 == aname {
             res.rank1 += 1;

@@ -24,11 +24,20 @@ const STACK_BASE: u64 = 0x20_0000_0000;
 const STACK_SIZE: u64 = 0x0004_0000;
 const RSP0: u64 = STACK_BASE + STACK_SIZE / 2;
 const RET_ADDR: u64 = 0x30_0000_0000;
+/// most on-the-fly pages one run may map before we stop and mark it capped.
+/// qemu asserts once a context holds too many memory regions, so this sits well
+/// under that ceiling. a run that wants more than this is pathological anyway.
+const MAX_RUNTIME_MAPS: usize = 1024;
 
 #[derive(Clone)]
 pub struct Config {
     pub instr_cap: u64,
     pub visit_cap: u32,
+    /// wall-clock backstop only, NOT a fingerprint-shaping bound. termination is
+    /// bounded deterministically by instr_cap + visit_cap + max_effects; this
+    /// just catches a genuine unicorn hang. keep it big so it never fires under
+    /// parallel CPU load, otherwise it truncates traces and the same binary
+    /// fingerprints differently run to run.
     pub timeout_us: u64,
     pub seed: u64,
     pub max_heapish: usize,
@@ -48,7 +57,7 @@ impl Default for Config {
         Config {
             instr_cap: 20_000,
             visit_cap: 64,
-            timeout_us: 250_000,
+            timeout_us: 3_000_000, // 3s hang guard, not a per-run budget
             seed: 0,
             max_heapish: 24,
             max_effects: 96,
@@ -82,6 +91,10 @@ struct Rec {
     branch_seen: usize,
     natural_dirs: Vec<bool>,
     pending_branch: Option<u64>, // target of the branch we just passed
+    // pages we've mapped on the fly during the run. qemu caps how many memory
+    // regions a context can hold, so we stop mapping past a limit and let the
+    // run end capped instead of letting unicorn abort the whole process.
+    map_count: usize,
 }
 
 impl Rec {
@@ -259,12 +272,13 @@ impl MicroExec {
             segs: image
                 .segments
                 .iter()
-                .map(|s| (s.vaddr, s.vaddr + s.bytes.len() as u64))
+                .map(|s| (s.vaddr, s.vaddr.saturating_add(s.bytes.len() as u64)))
                 .collect(),
             force: force.to_vec(),
             branch_seen: 0,
             natural_dirs: Vec::new(),
             pending_branch: None,
+            map_count: 0,
         };
 
         let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, rec)?;
@@ -340,6 +354,16 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
                 MemType::FETCH_UNMAPPED | MemType::FETCH_PROT | MemType::FETCH
             ) {
                 return false;
+            }
+            // too many distinct pages this run: stop before qemu's region cap
+            // aborts us. end the run capped, the partial trace is still usable.
+            {
+                let rec = uc.get_data_mut();
+                if rec.map_count >= MAX_RUNTIME_MAPS {
+                    rec.capped = true;
+                    return false;
+                }
+                rec.map_count += 1;
             }
             let page = addr & !(PAGE - 1);
             let seed = uc.get_data().cfg.seed;
@@ -447,7 +471,7 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
                 };
                 // skip the call entirely: callee never runs, stack stays balanced
                 let _ = uc.reg_write(RegisterX86::RAX, tag);
-                let _ = uc.reg_write(RegisterX86::RIP, addr + ilen);
+                let _ = uc.reg_write(RegisterX86::RIP, addr.wrapping_add(ilen));
             }
             Kind::Syscall => {
                 let nr = uc.reg_read(RegisterX86::RAX).unwrap_or(0) as u32;
@@ -458,7 +482,7 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
                     0x6666_0000_0000_0000u64 ^ rec.ret_ctr
                 };
                 let _ = uc.reg_write(RegisterX86::RAX, tag);
-                let _ = uc.reg_write(RegisterX86::RIP, addr + ilen);
+                let _ = uc.reg_write(RegisterX86::RIP, addr.wrapping_add(ilen));
             }
             Kind::Ret => {
                 let rax = uc.reg_read(RegisterX86::RAX).unwrap_or(0);
@@ -517,7 +541,9 @@ fn decode(rec: &Rec, addr: u64, buf: &[u8]) -> (Kind, u64) {
         // direct call E8 rel32 -> resolve target, else indirect -> anon
         let target = if buf[0] == 0xe8 {
             let rel = i32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as i64;
-            Some((addr as i64 + ilen as i64 + rel) as u64)
+            // wrapping: rip-relative math wraps on x86 and addr can sit near the
+            // top of the space, so never let this overflow-panic
+            Some(addr.wrapping_add(ilen).wrapping_add(rel as u64))
         } else {
             None
         };
@@ -542,10 +568,10 @@ fn decode(rec: &Rec, addr: u64, buf: &[u8]) -> (Kind, u64) {
 fn branch_target(addr: u64, ilen: u64, buf: &[u8]) -> Option<u64> {
     if (0x70..=0x7f).contains(&buf[0]) {
         let rel = buf[1] as i8 as i64;
-        Some((addr as i64 + ilen as i64 + rel) as u64)
+        Some(addr.wrapping_add(ilen).wrapping_add(rel as u64))
     } else if buf[0] == 0x0f && (0x80..=0x8f).contains(&buf[1]) {
         let rel = i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]) as i64;
-        Some((addr as i64 + ilen as i64 + rel) as u64)
+        Some(addr.wrapping_add(ilen).wrapping_add(rel as u64))
     } else {
         None
     }
@@ -558,11 +584,30 @@ fn ensure_pages(
     len: u64,
 ) -> Result<(), unicorn_engine::uc_error> {
     let first = start & !(PAGE - 1);
-    let last = (start + len + PAGE - 1) & !(PAGE - 1);
+    // saturating so a wild start+len from a crafted segment can't wrap the
+    // rounding; worst case last pins to the top page and the loop is bounded.
+    let last = start.saturating_add(len).saturating_add(PAGE - 1) & !(PAGE - 1);
+    if last <= first {
+        return Ok(());
+    }
+    // map the whole span in ONE call, not page by page. qemu caps how many
+    // memory regions a context can hold (phys_section_add asserts and aborts
+    // the process), so a multi-MB segment mapped a page at a time blows past
+    // that. one flat region per segment keeps the region count tiny.
+    let span = last - first;
+    if uc.mem_map(first, span, Prot::ALL).is_ok() {
+        let mut p = first;
+        while p < last {
+            mapped.insert(p);
+            p += PAGE;
+        }
+        return Ok(());
+    }
+    // bulk map failed, usually part of the span overlaps an existing region.
+    // fall back to mapping just the still-unmapped pages, one at a time.
     let mut p = first;
     while p < last {
         if mapped.insert(p) {
-            // ignore already-mapped errors from overlap, keep going
             let _ = uc.mem_map(p, PAGE, Prot::ALL);
         }
         p += PAGE;
@@ -652,6 +697,24 @@ mod tests {
             t.effects
         );
         assert!(ret_arg0, "should return arg0: {:?}", t.effects);
+    }
+
+    #[test]
+    fn branch_target_no_overflow_near_top_of_space() {
+        // a jcc with the most-negative rel32 at an address near u64::MAX. the
+        // old code did `addr as i64 + rel` and panicked on i64 overflow; the
+        // wrapping version must just return a wrapped target, no panic.
+        let addr = u64::MAX - 3;
+        let mut buf = [0u8; 16];
+        buf[0] = 0x0f;
+        buf[1] = 0x8c; // jl rel32
+        buf[2..6].copy_from_slice(&i32::MIN.to_le_bytes());
+        assert!(branch_target(addr, 6, &buf).is_some());
+        // rel8 backward at the very top too
+        let mut b8 = [0u8; 16];
+        b8[0] = 0x7c; // jl rel8
+        b8[1] = 0x80; // -128
+        assert!(branch_target(u64::MAX, 2, &b8).is_some());
     }
 
     #[test]
