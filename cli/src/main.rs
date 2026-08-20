@@ -214,13 +214,7 @@ fn cmd_eval(a: &str, b: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_triage(
-    target: &str,
-    vuln: &str,
-    patched: &str,
-    min_sim: f64,
-    margin: f64,
-) -> Result<()> {
+fn cmd_triage(target: &str, vuln: &str, patched: &str, min_sim: f64, margin: f64) -> Result<()> {
     let it = load_index(target)?;
     let vdb = Db::open(vuln).with_context(|| format!("opening vuln corpus {vuln}"))?;
     let pdb = Db::open(patched).with_context(|| format!("opening patched corpus {patched}"))?;
@@ -234,7 +228,9 @@ fn cmd_triage(
         "{} functions triaged: {} look vulnerable, {} patched, {} inconclusive",
         hits.len(),
         vulns.len(),
-        hits.iter().filter(|h| h.verdict == Verdict::Patched).count(),
+        hits.iter()
+            .filter(|h| h.verdict == Verdict::Patched)
+            .count(),
         hits.iter()
             .filter(|h| h.verdict == Verdict::Inconclusive)
             .count(),
