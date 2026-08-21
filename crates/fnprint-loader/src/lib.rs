@@ -81,7 +81,15 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
         );
     }
 
-    let mut segments = Vec::new();
+    // first pass: validate every PT_LOAD and sum what it WILL allocate, WITHOUT
+    // allocating anything yet. the total-memory guard has to count the actual
+    // bytes each segment holds, which is the file-window copy (end-start) grown to
+    // the bss tail (memsz), not p_memsz alone. a header with p_memsz=0 but a huge
+    // p_filesz still copies a whole file window, so many overlapping ones would
+    // amplify past the cap if we only counted memsz. computing the sum before any
+    // copy means such a bomb is rejected outright instead of ballooning up to the
+    // cap and only then bailing.
+    let mut plans: Vec<(usize, usize, usize, u64, bool, bool)> = Vec::new();
     let mut total_mem: u64 = 0;
     for ph in &elf.program_headers {
         if ph.p_type != goblin::elf::program_header::PT_LOAD {
@@ -100,10 +108,6 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
         if ph.p_vaddr.checked_add(ph.p_memsz).is_none() {
             bail!("PT_LOAD vaddr {:#x} + memsz overflows", ph.p_vaddr);
         }
-        total_mem = total_mem.saturating_add(ph.p_memsz);
-        if total_mem > MAX_TOTAL_MEM {
-            bail!("total PT_LOAD memory over {}-byte limit", MAX_TOTAL_MEM);
-        }
 
         // clamp the file window: p_offset past EOF must not slice-panic. try_from
         // so a value too big for usize (32-bit target) clamps to EOF instead of
@@ -113,22 +117,42 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
             .min(bytes.len());
         let fsz = usize::try_from(ph.p_filesz).unwrap_or(usize::MAX);
         let end = start.saturating_add(fsz).min(bytes.len());
-        let mut data = bytes[start..end].to_vec();
-        // bss: memsz > filesz, pad with zeros so reads there are defined.
         // p_memsz is already capped under MAX_SEG_MEM above, so it fits usize.
         let memsz = usize::try_from(ph.p_memsz).unwrap_or(usize::MAX);
+
+        let alloc_len = (end - start).max(memsz); // end >= start, no wrap
+        total_mem = total_mem.saturating_add(alloc_len as u64);
+        if total_mem > MAX_TOTAL_MEM {
+            bail!("total PT_LOAD memory over {}-byte limit", MAX_TOTAL_MEM);
+        }
+        plans.push((
+            start,
+            end,
+            memsz,
+            ph.p_vaddr,
+            ph.is_executable(),
+            ph.is_write(),
+        ));
+    }
+    if plans.is_empty() {
+        bail!("no PT_LOAD segments");
+    }
+
+    // second pass: now that the total is known-bounded, actually copy.
+    let mut segments = Vec::with_capacity(plans.len());
+    for (start, end, memsz, vaddr, exec, write) in plans {
+        let mut data = Vec::with_capacity((end - start).max(memsz));
+        data.extend_from_slice(&bytes[start..end]);
+        // bss: memsz > filesz, pad with zeros so reads there are defined.
         if memsz > data.len() {
             data.resize(memsz, 0);
         }
         segments.push(Segment {
-            vaddr: ph.p_vaddr,
+            vaddr,
             bytes: data,
-            exec: ph.is_executable(),
-            write: ph.is_write(),
+            exec,
+            write,
         });
-    }
-    if segments.is_empty() {
-        bail!("no PT_LOAD segments");
     }
 
     let is_pie = elf.header.e_type == goblin::elf::header::ET_DYN;
@@ -309,6 +333,56 @@ mod tests {
     fn vaddr_plus_memsz_overflow_is_refused() {
         let elf = craft_elf(0, u64::MAX - 16, 0, 4096);
         assert!(load(&elf).is_err());
+    }
+
+    // many overlapping file-backed PT_LOAD headers (p_memsz=0, huge p_filesz).
+    // each copies a full file window; the old cap only summed p_memsz so it never
+    // tripped and the loader would allocate n*filesize (hundreds of GB). the fix
+    // sums the real copy length and refuses before allocating anything.
+    fn craft_elf_many_load(n: u16) -> Vec<u8> {
+        let phoff = 64usize;
+        let file_len = phoff + (n as usize) * 56;
+        let mut e = vec![0u8; file_len];
+        e[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        e[4] = 2; // ELFCLASS64
+        e[5] = 1; // ELFDATA2LSB
+        e[6] = 1; // EV_CURRENT
+        let put16 =
+            |e: &mut [u8], off: usize, v: u16| e[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |e: &mut [u8], off: usize, v: u32| e[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |e: &mut [u8], off: usize, v: u64| e[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        put16(&mut e, 16, 2); // e_type ET_EXEC
+        put16(&mut e, 18, 62); // e_machine EM_X86_64
+        put32(&mut e, 20, 1);
+        put64(&mut e, 32, phoff as u64);
+        put16(&mut e, 52, 64);
+        put16(&mut e, 54, 56);
+        put16(&mut e, 56, n);
+        for i in 0..n as usize {
+            let ph = phoff + i * 56;
+            put32(&mut e, ph, 1); // PT_LOAD
+            put32(&mut e, ph + 4, 4); // R
+            put64(&mut e, ph + 8, 0); // p_offset = 0
+            put64(&mut e, ph + 16, 0x1000 + i as u64 * 0x1000); // distinct vaddr
+            put64(&mut e, ph + 32, file_len as u64); // p_filesz = whole file
+            put64(&mut e, ph + 40, 0); // p_memsz = 0, evades the old sum
+            put64(&mut e, ph + 48, 0x1000);
+        }
+        e
+    }
+
+    #[test]
+    fn overlapping_file_backed_segments_are_refused_not_allocated() {
+        // n * file_len copies far exceed MAX_TOTAL_MEM. must Err on accounting,
+        // never allocate its way there. (if this OOMs the test, the fix regressed.)
+        let elf = craft_elf_many_load(20000);
+        let r = load(&elf);
+        assert!(
+            r.is_err(),
+            "expected the alloc-amplification bomb to be refused"
+        );
     }
 
     #[test]

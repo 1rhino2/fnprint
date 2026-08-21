@@ -27,6 +27,9 @@ pub struct IndexedFunc {
 // re-exported so the cli's privsep worker can render dump output without
 // depending on the trace crate directly.
 pub use fnprint_trace::EffectTrace;
+// re-exported so the cli can validate a worker's fingerprint replies (sig length)
+// without a direct dep on the sig crate.
+pub use fnprint_sig::SIG_LEN;
 
 /// Force the rayon global pool to spawn its worker threads now. The sandboxed
 /// worker calls this before it jails itself, so the jail can forbid clone/clone3

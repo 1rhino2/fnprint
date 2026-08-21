@@ -98,7 +98,9 @@ mod linux {
             libc::SYS_futex,
             // thread creation for rayon + qemu helper threads. execve is NOT
             // allowed, so a clone/fork can only ever produce another jailed copy.
-            libc::SYS_clone,
+            // SYS_clone is added separately in build_allow_filter with a flag
+            // condition (no CLONE_NEW*). clone3 stays unconditional: its flags
+            // live in a struct behind a pointer that BPF cannot dereference.
             libc::SYS_clone3,
             libc::SYS_set_robust_list,
             libc::SYS_get_robust_list,
@@ -189,6 +191,28 @@ mod linux {
         ]
     }
 
+    // CLONE_NEW* namespace-creation flags. clone with any of these makes a new
+    // user/mount/net/etc namespace, which is the same escape-surface expansion we
+    // hard-kill unshare/setns for. real thread creation (rayon, qemu) never sets
+    // them, so gating clone on their absence costs legit code nothing. mask =
+    // NEWNS|NEWCGROUP|NEWUTS|NEWIPC|NEWUSER|NEWPID|NEWNET.
+    const CLONE_NEW_MASK: u64 = 0x7E02_0000;
+
+    // clone flags are arg0 on x86_64. allow the call only when none of the
+    // namespace bits are set; otherwise it falls through to the filter default
+    // (EPERM), so a popped worker can spawn threads but not create a namespace.
+    fn clone_flag_rule() -> Result<seccompiler::SeccompRule> {
+        use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
+        let cond = SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(CLONE_NEW_MASK),
+            0,
+        )
+        .context("clone flag condition")?;
+        SeccompRule::new(vec![cond]).context("clone flag rule")
+    }
+
     fn build_filter(
         syscalls: Vec<i64>,
         matched: SeccompAction,
@@ -201,17 +225,36 @@ mod linux {
         filter.try_into().context("compile seccomp filter")
     }
 
+    // the allow filter: every allowed syscall unconditionally, plus SYS_clone
+    // gated on clone_flag_rule (no namespace bits). default is EPERM soft-deny.
+    fn build_allow_filter(default: SeccompAction) -> Result<BpfProgram> {
+        let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = allowed_syscalls()
+            .into_iter()
+            .map(|nr| (nr, vec![]))
+            .collect();
+        rules.insert(libc::SYS_clone, vec![clone_flag_rule()?]);
+        let filter = SeccompFilter::new(rules, default, SeccompAction::Allow, TargetArch::x86_64)
+            .context("build allow filter")?;
+        filter.try_into().context("compile allow filter")
+    }
+
     fn install_seccomp() -> Result<()> {
         // EPERM(1): the soft-deny errno for anything not explicitly allowed.
         let eperm = SeccompAction::Errno(1);
-        let allow = build_filter(allowed_syscalls(), SeccompAction::Allow, eperm)?;
+        let allow = build_allow_filter(eperm)?;
         let kill = build_filter(
             kill_syscalls(),
             SeccompAction::KillProcess,
             SeccompAction::Allow,
         )?;
-        // apply both, most-severe-wins. order doesn't matter: the kernel keeps
-        // every installed filter and runs all of them per syscall.
+        // most-severe-wins: the kernel keeps every installed filter and runs all
+        // of them per syscall, so runtime order is irrelevant. INSTALL order is
+        // not: TSYNC needs the seccomp() syscall, which the EPERM-default allow
+        // filter does not permit, so the allow filter must go on SECOND while the
+        // kill filter (default-allow) still lets seccomp() through. if the second
+        // apply fails, lock_down_worker returns Err and the worker aborts before
+        // reading any input, so the transient kill-only posture never sees
+        // untrusted bytes (fail-closed is the caller's abort, not filter order).
         apply_filter_all_threads(&kill).context("apply kill filter")?;
         install_program(&allow)
     }

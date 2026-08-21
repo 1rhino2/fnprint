@@ -407,6 +407,20 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
         0,
         u64::MAX,
         |uc, _ty, addr, size, val| {
+            // the code hook enforces max_effects, but only between instructions.
+            // a single `rep stos/movs` fires this write hook once per iteration
+            // with RCX seeded huge, so without a gate here the effects vec grows
+            // to millions from a 2-byte body. cap here too and stop the run.
+            {
+                let rec = uc.get_data_mut();
+                if rec.effects.len() >= rec.cfg.max_effects {
+                    rec.capped = true;
+                }
+            }
+            if uc.get_data().capped {
+                uc.emu_stop().ok();
+                return true;
+            }
             let rec = uc.get_data_mut();
             rec.note_new_region(addr);
             let (region, off) = rec.classify_addr(addr);
@@ -766,6 +780,26 @@ mod tests {
             "effects not capped: {}",
             t.effects.len()
         );
+    }
+
+    #[test]
+    fn rep_store_flood_is_capped() {
+        // `rep stosb` is ONE instruction that writes RCX times, and RCX is seeded
+        // huge. the per-instruction code-hook cap never runs between the writes,
+        // so the write hook itself has to enforce max_effects or the effects vec
+        // grows to millions from a 2-byte body. f3 aa = rep stos byte ; c3 ret.
+        let code = [0xf3, 0xaa, 0xc3];
+        let cfg = Config {
+            max_effects: 32,
+            ..Config::default()
+        };
+        let t = MicroExec::new(cfg).run(&img(&code), &f(), &HashMap::new());
+        assert!(
+            t.effects.len() <= 40,
+            "rep-store effects not capped: {}",
+            t.effects.len()
+        );
+        assert!(t.capped, "rep flood should mark the trace capped");
     }
 
     #[test]

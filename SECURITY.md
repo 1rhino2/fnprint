@@ -50,6 +50,8 @@ jails itself:
   set fails soft with `EPERM`. So `open`/`openat` return `EPERM`: a popped worker
   can't read a file off your disk or open a socket, but qemu's best-effort probes
   of `/sys` and `/proc` degrade to an error instead of taking the run down.
+  `clone` is allowed for thread creation but only with no `CLONE_NEW*` flag, so a
+  popped worker can spawn threads but not create a namespace.
 
 The result: a memory-corruption exploit that lands inside unicorn from a crafted
 input can still compute in its own address space, but it can't exec a shell, open
@@ -65,7 +67,32 @@ What the sandbox does not cover yet: reading a corpus `.db` (for `match`,
 `query`, `triage`) parses that SQLite file in the trusted parent, not in the
 jail. Treat a `.db` you did not build as untrusted input too, and don't point
 those subcommands at a corpus from someone you don't trust until that path is
-jailed as well.
+jailed as well. The corpus path is defended against SQL injection (every value
+is a bound parameter) and against malformed rows (a bad row is a clean error,
+not a crash), but it is not jailed.
+
+### Known residuals
+
+These are understood and accepted, not oversights:
+
+- `clone3` is allowed unconditionally. Its flags live in a struct behind a
+  pointer that a seccomp BPF filter cannot dereference, so unlike `clone` it
+  can't be flag-filtered, and a popped worker could create a user namespace
+  through it. This is not a jail escape: the seccomp filters and `no_new_privs`
+  are inherited across the namespace change, so every catastrophic syscall stays
+  killed and everything unlisted stays `EPERM` inside the new namespace. The
+  residual is that userns-dependent kernel attack surface stays reachable. We
+  keep `clone3` open because denying it breaks thread creation on current glibc.
+- x32 ABI. The kill-list tripwire matches native x86-64 syscall numbers; an x32
+  call (syscall bit `0x40000000`) misses both lists and lands on the allow
+  filter's `EPERM` default. So x32 catastrophic calls are still contained (they
+  fail), but they return `EPERM` rather than `SIGSYS`, so a monitor keying on
+  `SIGSYS` won't see them. The i386/`int 0x80` compat gate is hard-killed.
+- Resource limits are a backstop, not a fence. `RLIMIT_NPROC` is deliberately
+  not clamped (it would break qemu's helper threads), so a popped worker could
+  fork more jailed copies; each is still fully jailed, and OOM handling is the
+  host's job. `RLIMIT_CPU` bounds CPU but there is no wall-clock bound on a
+  syscall that just blocks.
 
 ## Reporting
 

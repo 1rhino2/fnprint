@@ -18,7 +18,12 @@ use serde::{Deserialize, Serialize};
 // alloc. an ELF bigger than this we refuse; a worker reply bigger than this we
 // treat as a compromised worker.
 const MAX_INPUT: u64 = 512 << 20; // 512 MiB
-const MAX_REPLY: u64 = 512 << 20;
+                                  // the reply is fingerprints, far smaller than the input binary, so cap it well
+                                  // below the input. postcard varint-decodes each u64 (1 wire byte for a zero)
+                                  // into 8 resident bytes, so a compromised worker could amplify ~8x; 128 MiB
+                                  // still fits any realistic binary's prints (~400k functions) while bounding the
+                                  // trusted parent's worst-case decode to ~1 GiB.
+const MAX_REPLY: u64 = 128 << 20;
 
 // the hidden argv token the parent re-execs itself with to become the jailed
 // worker. anything the emulator touches runs behind it.
@@ -210,7 +215,12 @@ fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply>
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        // capture stderr instead of handing the worker our terminal. a crash or
+        // panic message there can carry attacker-controlled bytes (a symbol name
+        // echoed by the parser), and an inherited tty would let raw escape
+        // sequences through unescaped. we drain it on a thread, keep a bounded
+        // tail, and esc() it before it ever reaches the terminal.
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().context("spawning jailed worker")?;
 
     let mut stdin = child.stdin.take().context("worker stdin")?;
@@ -219,6 +229,17 @@ fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply>
         // ignore the error: if the worker died early we'll see it in wait()
         let _ = stdin.write_all(&payload);
         drop(stdin);
+    });
+
+    // drain stderr on its own thread so a chatty worker can't wedge on a full
+    // stderr pipe while we're blocked reading stdout. keep only a bounded tail;
+    // discard the rest so the worker never blocks writing.
+    let mut errpipe = child.stderr.take().context("worker stderr")?;
+    let errdrain = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = errpipe.by_ref().take(8 * 1024).read_to_end(&mut buf);
+        let _ = std::io::copy(&mut errpipe, &mut std::io::sink());
+        buf
     });
 
     let mut out = Vec::new();
@@ -232,9 +253,18 @@ fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply>
     }
     let status = child.wait().context("waiting on worker")?;
     let _ = writer.join();
+    let errtail = errdrain.join().unwrap_or_default();
 
     if !status.success() {
-        bail!("jailed worker exited abnormally ({status}) - likely killed by the sandbox or a crash in the emulator");
+        let tail = String::from_utf8_lossy(&errtail);
+        let tail = tail.trim();
+        if tail.is_empty() {
+            bail!("jailed worker exited abnormally ({status}) - likely killed by the sandbox or a crash in the emulator");
+        }
+        bail!(
+            "jailed worker exited abnormally ({status}) - likely killed by the sandbox or a crash in the emulator; stderr: {}",
+            esc(tail)
+        );
     }
     if out.len() as u64 > MAX_REPLY {
         bail!("jailed worker reply over size cap");
@@ -250,10 +280,27 @@ fn run_index(bytes: &[u8], no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
         return index_bytes(bytes, Config::default());
     }
     match run_worker("index", None, bytes)? {
-        WorkerReply::IndexOk(funcs) => Ok(funcs),
-        WorkerReply::Err(e) => bail!("{e}"),
+        WorkerReply::IndexOk(funcs) => {
+            validate_reply_fps(&funcs)?;
+            Ok(funcs)
+        }
+        // the worker's error text is built from the parser, which handles attacker
+        // bytes; escape it so a crafted error can't smuggle terminal sequences.
+        WorkerReply::Err(e) => bail!("{}", esc(&e)),
         _ => bail!("worker returned the wrong reply kind for index"),
     }
+}
+
+// a compromised worker controls its reply. every fingerprint must carry a
+// SIG_LEN signature; reject a malformed one loudly here rather than letting it
+// flow into the comparators as silent zero-similarity noise.
+fn validate_reply_fps(funcs: &[IndexedFunc]) -> Result<()> {
+    for f in funcs {
+        if f.fp.sig.len() != fnprint_core::SIG_LEN {
+            bail!("jailed worker returned a fingerprint with an invalid signature length");
+        }
+    }
+    Ok(())
 }
 
 fn run_dump(bytes: &[u8], func: &str, no_sandbox: bool) -> Result<Vec<String>> {
@@ -263,7 +310,7 @@ fn run_dump(bytes: &[u8], func: &str, no_sandbox: bool) -> Result<Vec<String>> {
     }
     match run_worker("dump", Some(func), bytes)? {
         WorkerReply::DumpOk(lines) => Ok(lines),
-        WorkerReply::Err(e) => bail!("{e}"),
+        WorkerReply::Err(e) => bail!("{}", esc(&e)),
         _ => bail!("worker returned the wrong reply kind for dump"),
     }
 }
