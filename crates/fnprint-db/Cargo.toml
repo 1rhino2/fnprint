@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
-fnprint-sig = { path = "../fnprint-sig", version = "0.2.0" }
+fnprint-sig = { path = "../fnprint-sig", version = "0.2.3" }
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "fnprint"
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 license.workspace = true
 description = "Match functions in binaries by what they do, not what their bytes look like"
@@ -16,11 +16,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-fnprint-core = { path = "../crates/fnprint-core", version = "0.2.0" }
-fnprint-db = { path = "../crates/fnprint-db", version = "0.2.0" }
-fnprint-loader = { path = "../crates/fnprint-loader", version = "0.2.0" }
-fnprint-emu = { path = "../crates/fnprint-emu", version = "0.2.0" }
-fnprint-sandbox = { path = "../crates/fnprint-sandbox", version = "0.2.0" }
+fnprint-core = { path = "../crates/fnprint-core", version = "0.2.3" }
+fnprint-db = { path = "../crates/fnprint-db", version = "0.2.3" }
+fnprint-loader = { path = "../crates/fnprint-loader", version = "0.2.3" }
+fnprint-emu = { path = "../crates/fnprint-emu", version = "0.2.3" }
+fnprint-sandbox = { path = "../crates/fnprint-sandbox", version = "0.2.3" }
 serde = { workspace = true }
 postcard = { workspace = true }
 
