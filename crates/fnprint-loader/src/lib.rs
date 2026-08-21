@@ -65,12 +65,16 @@ pub struct Loaded {
 }
 
 /// a single PT_LOAD bigger than this is refused rather than allocated. real RE
-/// targets, firmware included, sit well under it; anything past it is a crafted
-/// header trying to make us allocate our way into an OOM.
-const MAX_SEG_MEM: u64 = 1 << 31; // 2 GiB
+/// targets, firmware included, sit well under it (real binaries run single-digit
+/// to low-hundreds of MB); anything past it is a crafted header (tiny p_filesz,
+/// huge p_memsz) trying to amplify a few bytes of file into a big zero-fill and
+/// allocate our way into an OOM. kept at 1 GiB: still orders of magnitude over
+/// any real input, but it halves the worst-case single-shot allocation a crafted
+/// bss claim can force.
+const MAX_SEG_MEM: u64 = 1 << 30; // 1 GiB
 /// total mapped memory across all segments, same idea, bounds a fan-out of many
 /// medium segments that each pass the per-segment check.
-const MAX_TOTAL_MEM: u64 = 1 << 32; // 4 GiB
+const MAX_TOTAL_MEM: u64 = 1 << 31; // 2 GiB
 
 pub fn load(bytes: &[u8]) -> Result<Loaded> {
     let elf = Elf::parse(bytes).context("not a valid elf")?;

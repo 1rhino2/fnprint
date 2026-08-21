@@ -2,3 +2,16 @@
 # eats untrusted binaries should have its GOT locked read-only after startup.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,-z,relro,-z,now"]
+
+# harden the bundled C libraries themselves. capstone and sqlite are compiled
+# from source by the cc crate and, without this, ship with zero stack canaries
+# and no fortify: the biggest native attack surface (capstone disassembly of
+# attacker bytes) had no per-object protection. force stack-protector-strong,
+# fortify, and PIE onto every C/C++ object the build compiles. the -U before the
+# -D avoids a redefinition warning on distros that already set _FORTIFY_SOURCE.
+# force=true so a stray CFLAGS in the environment can't drop the hardening.
+# (unicorn builds through its own configure and hardens itself; this covers the
+# cc-crate builds it doesn't.)
+[env]
+CFLAGS = { value = "-fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fPIE", force = true }
+CXXFLAGS = { value = "-fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fPIE", force = true }

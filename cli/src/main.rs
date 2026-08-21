@@ -9,7 +9,7 @@ use fnprint_core::{
     dump_traces, eval, index_bytes, match_by_name, query_corpus, source_str, triage, warm_pool,
     EffectTrace, IndexedFunc, Verdict, MIN_COMPLEXITY,
 };
-use fnprint_db::Db;
+use fnprint_db::{Db, FuncRec, MemCorpus};
 use fnprint_emu::Config;
 use fnprint_loader::FuncSource;
 use serde::{Deserialize, Serialize};
@@ -19,10 +19,16 @@ use serde::{Deserialize, Serialize};
 // treat as a compromised worker.
 const MAX_INPUT: u64 = 512 << 20; // 512 MiB
                                   // the reply is fingerprints, far smaller than the input binary, so cap it well
-                                  // below the input. postcard varint-decodes each u64 (1 wire byte for a zero)
-                                  // into 8 resident bytes, so a compromised worker could amplify ~8x; 128 MiB
-                                  // still fits any realistic binary's prints (~400k functions) while bounding the
-                                  // trusted parent's worst-case decode to ~1 GiB.
+                                  // below the input. a compromised worker can amplify the wire size on decode:
+                                  // postcard varint-decodes each zero u64 (1 wire byte) into 8 resident bytes,
+                                  // and the Vec<String>/Vec<FuncRec> shapes add per-element String/struct
+                                  // overhead on top, so the real worst case is ~24x, not 8x: a full 128 MiB
+                                  // reply can balloon to roughly 3 GiB transient in the parent before it is
+                                  // dropped. that is a compromised-worker-only DoS (the jail already held), it
+                                  // stays bounded by the parent's own RLIMIT_AS, and 128 MiB still fits any
+                                  // realistic binary's prints (~400k functions). we keep the cap here rather
+                                  // than lower it (a smaller cap would false-reject a legit large binary's
+                                  // reply as if the worker were compromised).
 const MAX_REPLY: u64 = 128 << 20;
 
 // the hidden argv token the parent re-execs itself with to become the jailed
@@ -36,6 +42,9 @@ const WORKER_TOKEN: &str = "__worker";
 enum WorkerReply {
     IndexOk(Vec<IndexedFunc>),
     DumpOk(Vec<String>),
+    // decoded corpus rows from the jailed db-reader. the parent rebuilds the LSH
+    // index from these in memory; it never runs sqlite on the .db itself.
+    DbOk(Vec<FuncRec>),
     Err(String),
 }
 
@@ -163,6 +172,12 @@ fn worker_main(op: &str, func: Option<&str>) -> Result<()> {
                 Err(e) => WorkerReply::Err(format!("{e:#}")),
             }
         }
+        // parse the untrusted corpus .db image in memory (no file open, so it
+        // runs under this same jail) and hand the decoded rows back.
+        "dbload" => match Db::open_image(&input).and_then(|db| db.all()) {
+            Ok(recs) => WorkerReply::DbOk(recs),
+            Err(e) => WorkerReply::Err(format!("{e:#}")),
+        },
         other => WorkerReply::Err(format!("unknown worker op: {other}")),
     };
     emit(&reply)
@@ -337,12 +352,59 @@ fn esc(s: &str) -> String {
     out
 }
 
-// load an index from either an ELF (jailed emulation) or a prebuilt db
+// a compromised db-reader worker controls its reply, same threat model as the
+// index reply: reject any record whose fingerprint isn't a well-formed SIG_LEN
+// signature rather than letting it flow into the comparators as silent noise.
+fn validate_corpus_records(recs: &[FuncRec]) -> Result<()> {
+    for r in recs {
+        if r.fp.sig.len() != fnprint_core::SIG_LEN {
+            bail!("jailed db worker returned a record with an invalid signature length");
+        }
+    }
+    Ok(())
+}
+
+// read a corpus .db and return its decoded rows. jailed by default: the parent
+// reads the file bytes off disk but never parses them with sqlite; a jailed
+// worker deserializes the image in memory and hands back decoded records. so a
+// hostile .db can only ever hit sqlite inside the jail. --no-sandbox keeps the
+// old in-process sqlite read for platforms that can't jail (loud opt-out).
+fn load_corpus_records(path: &str, no_sandbox: bool) -> Result<Vec<FuncRec>> {
+    if no_sandbox {
+        eprintln!("warning: --no-sandbox, parsing corpus with in-process sqlite (unjailed)");
+        return Db::open(path)
+            .with_context(|| format!("opening corpus {path}"))?
+            .all();
+    }
+    let bytes = fs::read(path).with_context(|| format!("reading corpus {path}"))?;
+    if bytes.len() as u64 > MAX_INPUT {
+        bail!("corpus {path} over size cap");
+    }
+    match run_worker("dbload", None, &bytes)? {
+        WorkerReply::DbOk(recs) => {
+            validate_corpus_records(&recs)?;
+            Ok(recs)
+        }
+        // the worker's error text can carry attacker bytes (sqlite echoing a
+        // crafted string); escape it before it reaches the terminal.
+        WorkerReply::Err(e) => bail!("{}", esc(&e)),
+        _ => bail!("worker returned the wrong reply kind for dbload"),
+    }
+}
+
+// build the in-memory corpus (records + rebuilt LSH bands) that query/triage
+// consume. no sqlite touches the untrusted image in the trusted parent.
+fn load_corpus(path: &str, no_sandbox: bool) -> Result<MemCorpus> {
+    Ok(MemCorpus::from_records(load_corpus_records(
+        path, no_sandbox,
+    )?))
+}
+
+// load an index from either an ELF (jailed emulation) or a prebuilt db (jailed
+// sqlite parse). in both cases the untrusted bytes are parsed behind the jail.
 fn load_index(path: &str, no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
     if is_db(path) {
-        let db = Db::open(path)?;
-        Ok(db
-            .all()?
+        Ok(load_corpus_records(path, no_sandbox)?
             .into_iter()
             .map(|r| IndexedFunc {
                 name: r.name,
@@ -417,7 +479,7 @@ fn cmd_match(a: &str, b: &str, no_sandbox: bool) -> Result<()> {
 
 fn cmd_query(target: &str, corpus: &str, threshold: f64, no_sandbox: bool) -> Result<()> {
     let it = load_index(target, no_sandbox)?;
-    let db = Db::open(corpus).with_context(|| format!("opening corpus {corpus}"))?;
+    let db = load_corpus(corpus, no_sandbox)?;
     let named = query_corpus(&it, &db, threshold)?;
 
     if named.is_empty() {
@@ -474,8 +536,8 @@ fn cmd_triage(
     no_sandbox: bool,
 ) -> Result<()> {
     let it = load_index(target, no_sandbox)?;
-    let vdb = Db::open(vuln).with_context(|| format!("opening vuln corpus {vuln}"))?;
-    let pdb = Db::open(patched).with_context(|| format!("opening patched corpus {patched}"))?;
+    let vdb = load_corpus(vuln, no_sandbox)?;
+    let pdb = load_corpus(patched, no_sandbox)?;
     let hits = triage(&it, &vdb, &pdb, min_sim, margin)?;
 
     let vulns: Vec<_> = hits

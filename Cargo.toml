@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -24,7 +24,9 @@ goblin = "0.8"
 gimli = "0.31"
 capstone = "0.12"
 unicorn-engine = "2.1"
-rusqlite = { version = "0.31", features = ["bundled"] }
+# serialize gives sqlite3_deserialize, used to parse a corpus .db entirely in
+# memory inside the jailed worker (no file open), see fnprint-db::Db::open_image.
+rusqlite = { version = "0.31", features = ["bundled", "serialize"] }
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -41,9 +43,11 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# the whole workspace is unsafe-free and stays that way; the only native memory
-# lives inside the unicorn/capstone/sqlite C libs, not our code. also ban the
-# panic-macro family so no parse path can grow a panic (none exist today).
+# the workspace is unsafe-forbid everywhere except fnprint-db, which carries one
+# audited unsafe FFI shim (sqlite3_malloc for deserialize; it has its own
+# [lints] setting unsafe_code = "deny" plus a single scoped #[allow]). the only
+# native memory lives inside the unicorn/capstone/sqlite C libs, not our code.
+# also ban the panic-macro family so no parse path can grow a panic (none today).
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

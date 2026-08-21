@@ -33,6 +33,10 @@ can't afford to have the emulator crash on.
   overflowing sizes, and absurd `p_memsz`. Fuzz targets live in `fuzz/`.
 - Attacker-controlled symbol names are escaped before they are printed, so a
   crafted name can't smuggle terminal escape sequences into your terminal.
+- The bundled C libraries (capstone, sqlite) are compiled with
+  `-fstack-protector-strong`, `-D_FORTIFY_SOURCE=2`, and `-fPIE`, so the biggest
+  native attack surface has per-object stack canaries and fortified libc calls,
+  not just RELRO/PIE on the final link. See `.cargo/config.toml`.
 
 ## Sandbox (Linux)
 
@@ -46,7 +50,8 @@ jails itself:
 - Two stacked seccomp filters, applied to every thread (rayon and qemu spawn
   threads, and the emulation runs on them). The catastrophic syscalls, `execve`,
   `ptrace`, the whole socket family, module/kexec/bpf, mount/chroot/namespace,
-  the setuid family, hard-kill the process. Anything else not on a small allow
+  the setuid family, and the async-io/fault primitives (`io_uring`,
+  `userfaultfd`, `pidfd_getfd`) hard-kill the process. Anything else not on a small allow
   set fails soft with `EPERM`. So `open`/`openat` return `EPERM`: a popped worker
   can't read a file off your disk or open a socket, but qemu's best-effort probes
   of `/sys` and `/proc` degrade to an error instead of taking the run down.
@@ -55,21 +60,35 @@ jails itself:
 
 The result: a memory-corruption exploit that lands inside unicorn from a crafted
 input can still compute in its own address space, but it can't exec a shell, open
-a file, or reach the network. The trusted parent does the database and terminal
-output; it never runs the emulator.
+a file, or reach the network. The trusted parent does the terminal output; it
+never runs the emulator.
+
+Reading a corpus `.db` (for `match`, `query`, `triage`) is jailed the same way.
+SQLite is another large C library fed attacker bytes when the corpus is one you
+did not build, so the parse runs behind the jail, not in the trusted parent. The
+parent reads the file into memory as a raw byte blob (a plain `read()`, no SQLite
+involved) and hands those bytes to a worker over the pipe, exactly like the ELF
+path. The worker jails itself, then parses the image entirely in memory with
+`sqlite3_deserialize` (read-only) and returns the decoded fingerprint rows. No
+file is opened for the parse: the whole SQLite surface (b-tree pages, cell and
+record decoding, overflow pages) only ever touches that in-memory buffer, under
+the same seccomp filters that jail the emulator. The parent then rebuilds the LSH
+band index from the returned rows in safe Rust and runs the comparison; it never
+runs SQLite on the untrusted image. The corpus path is also defended against SQL
+injection (every value is a bound parameter) and against malformed rows (a bad
+row is a clean error, not a crash), and the parent revalidates each returned row
+(a well-formed `SIG_LEN` signature) since a popped worker controls its reply.
 
 Fail-closed: if the jail won't install, the worker refuses to process input.
 `--no-sandbox` is an explicit, loud opt-out for a platform that can't jail (the
-sandbox is Linux-only) or for debugging. It runs the emulator in-process with no
-containment, so only use it when you trust the input.
+sandbox is Linux-only) or for debugging. It runs the emulator in-process and
+reads the corpus with in-process SQLite, no containment, so only use it when you
+trust the input.
 
-What the sandbox does not cover yet: reading a corpus `.db` (for `match`,
-`query`, `triage`) parses that SQLite file in the trusted parent, not in the
-jail. Treat a `.db` you did not build as untrusted input too, and don't point
-those subcommands at a corpus from someone you don't trust until that path is
-jailed as well. The corpus path is defended against SQL injection (every value
-is a bound parameter) and against malformed rows (a bad row is a clean error,
-not a crash), but it is not jailed.
+What is still not jailed: `index --out corpus.db` opens the output database with
+in-process SQLite in the parent to write rows into it. That is a corpus you are
+building, not one you were handed; if you point `--out` at an existing `.db` from
+someone you don't trust, that file is parsed unjailed. Build your own corpora.
 
 ### Known residuals
 
@@ -88,6 +107,12 @@ These are understood and accepted, not oversights:
   filter's `EPERM` default. So x32 catastrophic calls are still contained (they
   fail), but they return `EPERM` rather than `SIGSYS`, so a monitor keying on
   `SIGSYS` won't see them. The i386/`int 0x80` compat gate is hard-killed.
+- One `unsafe` FFI block exists, in `fnprint-db::owned_from_bytes`. `deserialize`
+  takes ownership of a buffer SQLite will later free, so the buffer must come from
+  `sqlite3_malloc`; there is no safe constructor for it from a `&[u8]`. The block
+  is a length-checked copy into a freshly allocated block, dereferences no
+  attacker data, and NULL-checks the allocation. Every other crate stays
+  `unsafe_code = "forbid"`; `fnprint-db` is `deny` with that one scoped `#[allow]`.
 - Resource limits are a backstop, not a fence. `RLIMIT_NPROC` is deliberately
   not clamped (it would break qemu's helper threads), so a popped worker could
   fork more jailed copies; each is still fully jailed, and OOM handling is the

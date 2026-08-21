@@ -27,7 +27,13 @@ const RET_ADDR: u64 = 0x30_0000_0000;
 /// most on-the-fly pages one run may map before we stop and mark it capped.
 /// qemu asserts once a context holds too many memory regions, so this sits well
 /// under that ceiling. a run that wants more than this is pathological anyway.
-const MAX_RUNTIME_MAPS: usize = 1024;
+/// kept low on purpose: softmmu bookkeeping grows super-linearly with resident
+/// maps, so a crafted read-flood binary that touches thousands of distinct pages
+/// used to burn ~90s cpu before the old 1024 cap fired. legit functions touch
+/// far fewer (reads dedup at 64 fields, max_heapish is 24), so 256 gives real
+/// code plenty of headroom while cutting the worst-case cost ~16x. bench accuracy
+/// is unchanged at this value (verified against NUMBERS.md).
+const MAX_RUNTIME_MAPS: usize = 256;
 
 #[derive(Clone)]
 pub struct Config {

@@ -188,6 +188,18 @@ mod linux {
             libc::SYS_swapoff,
             libc::SYS_iopl,
             libc::SYS_ioperm,
+            // async-io and fault-handling primitives a popped worker has no legit
+            // use for. they were already contained (EPERM soft-deny by default),
+            // but qemu/rayon never issue them, so promote them to a hard-kill
+            // tripwire: an attempt is an unambiguous escape probe, not noise.
+            // io_uring gives a shared submission ring that can sidestep per-syscall
+            // filtering; userfaultfd hands page-fault handling to userspace (a
+            // known exploit primitive); pidfd_getfd steals fds from another proc.
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+            libc::SYS_userfaultfd,
+            libc::SYS_pidfd_getfd,
         ]
     }
 

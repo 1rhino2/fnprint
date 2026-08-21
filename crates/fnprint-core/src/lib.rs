@@ -1,9 +1,10 @@
 //! Index / match / query, built on the loader + emulator + fingerprint + db.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use anyhow::Result;
-use fnprint_db::Db;
+use fnprint_db::{Corpus, Db};
 use fnprint_emu::{Config, MicroExec};
 use fnprint_loader::{Func, FuncSource};
 use fnprint_sig::Fingerprint;
@@ -15,6 +16,16 @@ pub const MIN_COMPLEXITY: u32 = 4;
 pub const SAME_THRESH: f64 = 0.88;
 /// fixed seeds used per function. deterministic, so prints are reproducible.
 const SEEDS: [u64; 4] = [0, 0x9e3779b9, 0x1234_5678, 0xdead_beef];
+
+// unicorn/qemu keep process-global TCG (translation) state, so two engines
+// running at once in different rayon threads corrupt each other's translation
+// and the same binary fingerprints differently run to run. serialize the actual
+// emulation behind this lock: the loop still parallelizes, but only one
+// run_explore executes at a time, which restores byte-identical prints. the
+// non-emulation work (loading, fingerprint hashing) still overlaps. a future
+// fix can shard functions across worker processes to get parallelism back
+// without the shared globals; for now correctness wins over the extra cores.
+static EMU_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct IndexedFunc {
@@ -64,10 +75,17 @@ pub fn index_bytes(bytes: &[u8], cfg: Config) -> Result<Vec<IndexedFunc>> {
         .par_iter()
         .filter(|f| f.size > 0 && image.code_at(f.entry, 1).is_some())
         .map(|f: &Func| {
-            let ex = MicroExec::new(cfg.clone());
-            // a few deterministic seeds vary the input buffers so behavior that
-            // only shows up on some inputs still makes it into the print.
-            let traces = ex.run_explore(image, f, &symbols, &SEEDS);
+            // hold the emu lock across engine build + run: engine creation also
+            // touches the shared TCG globals, so both must be serialized. recover
+            // a poisoned lock instead of panicking (a panic here would abort the
+            // whole index under panic=abort).
+            let traces = {
+                let _g = EMU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let ex = MicroExec::new(cfg.clone());
+                // a few deterministic seeds vary the input buffers so behavior
+                // that only shows up on some inputs still makes it into the print.
+                ex.run_explore(image, f, &symbols, &SEEDS)
+            };
             IndexedFunc {
                 name: f.name.clone(),
                 entry: f.entry,
@@ -176,9 +194,9 @@ pub struct Named {
 /// best-scoring named function in a corpus for one print. narrows with the LSH
 /// bands first and falls back to the full set if no band hit. returns
 /// (similarity, name, binary). the preloaded `all` is the fallback pool.
-fn best_in_corpus(
+fn best_in_corpus<C: Corpus>(
     fp: &Fingerprint,
-    db: &Db,
+    db: &C,
     all: &[fnprint_db::FuncRec],
 ) -> Result<Option<(f64, String, String)>> {
     let cands = db.candidates(fp)?;
@@ -202,7 +220,11 @@ fn best_in_corpus(
 
 /// for each function in the target that we can trust, pull the best-matching
 /// named function out of the corpus db. withholds tiny/low-signal functions.
-pub fn query_corpus(target: &[IndexedFunc], corpus: &Db, threshold: f64) -> Result<Vec<Named>> {
+pub fn query_corpus<C: Corpus>(
+    target: &[IndexedFunc],
+    corpus: &C,
+    threshold: f64,
+) -> Result<Vec<Named>> {
     let named = corpus.all()?; // small corpora, fine to hold in memory
     let mut out = Vec::new();
     for f in target {
@@ -270,10 +292,10 @@ fn verdict_order(v: Verdict) -> u8 {
 /// `min_sim`: a side has to be at least this similar to count as a real lead.
 /// `margin`: how far the two sides must separate before we commit to a verdict.
 /// the result is sorted as a review queue, strongest vulnerable lead first.
-pub fn triage(
+pub fn triage<C: Corpus>(
     target: &[IndexedFunc],
-    vuln: &Db,
-    patched: &Db,
+    vuln: &C,
+    patched: &C,
     min_sim: f64,
     margin: f64,
 ) -> Result<Vec<TriageHit>> {

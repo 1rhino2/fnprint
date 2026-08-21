@@ -9,7 +9,19 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
-fnprint-sig = { path = "../fnprint-sig", version = "0.2.3" }
+serde = { workspace = true }
+fnprint-sig = { path = "../fnprint-sig", version = "0.2.4" }
 
-[lints]
-workspace = true
+# fnprint-db is the ONE crate that is not unsafe-forbid. deserialize()'s only
+# constructor for its owned buffer is an unsafe FFI (sqlite3_malloc + copy), so
+# unsafe is "deny" here (overridable by a single scoped #[allow] on that shim)
+# instead of the workspace-wide "forbid". everything else matches the workspace.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+mem_forget = "deny"
