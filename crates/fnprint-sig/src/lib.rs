@@ -74,6 +74,9 @@ impl Fingerprint {
     /// LSH band keys. b bands of r rows, b*r == SIG_LEN. Two prints that share
     /// any band key are worth actually comparing.
     pub fn band_keys(&self, r: usize) -> Vec<u64> {
+        // chunks(0) panics; every internal caller passes BAND_ROWS (nonzero), but
+        // this is pub on a published crate, so guard against a direct band_keys(0).
+        let r = r.max(1);
         let mut out = Vec::new();
         for band in self.sig.chunks(r) {
             let mut h = 0xcbf29ce484222325u64;

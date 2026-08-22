@@ -68,13 +68,21 @@ jails itself:
   can't read a file off your disk or open a socket, but qemu's best-effort probes
   of `/sys` and `/proc` degrade to an error instead of taking the run down.
   `clone` is allowed for thread creation but only with no `CLONE_NEW*` flag, so a
-  popped worker can spawn threads but not create a namespace.
+  popped worker can spawn threads but not create a namespace. `clone3` can't be
+  flag-filtered (its flags sit behind a pointer BPF can't read), so it is turned
+  into `ENOSYS`: glibc's `pthread_create` tries `clone3` first and falls back to
+  the flag-gated `clone` on `ENOSYS`, so threads still work while a
+  `clone3(CLONE_NEWUSER)` cannot create a namespace either. The legacy and the
+  new mount API (`fsopen`/`fsmount`/`move_mount`/`open_tree`/...) both hard-kill.
 - `mmap` and `mprotect` are allowed only without `PROT_EXEC` (the bit is checked
   in the prot argument, the same masked-arg trick used for the `clone` flags).
   Because unicorn is built no-JIT, nothing legitimate ever needs an executable
   page, so a popped worker cannot map new executable memory or flip an existing
   page to executable. Combined with the `/proc/self/maps` check above, there is
-  no writable-executable memory in the worker at any point.
+  no writable-executable memory in the worker at any point. (The emulator maps the
+  guest's own pages `Prot::ALL` inside unicorn's software MMU; that is emulated
+  guest permission the interpreter reads, not a host page, so it creates no host
+  executable memory.)
 
 The result: a memory-corruption exploit that lands inside unicorn from a crafted
 input can still compute in its own address space, but it cannot run code it
@@ -113,16 +121,18 @@ someone you don't trust, that file is parsed unjailed. Build your own corpora.
 
 These are understood and accepted, not oversights:
 
-- `clone3` is allowed unconditionally. Its flags live in a struct behind a
-  pointer that a seccomp BPF filter cannot dereference, so unlike `clone` it
-  can't be flag-filtered, and a popped worker could create a user namespace
-  through it. This is not a jail escape: the seccomp filters and `no_new_privs`
-  are inherited across the namespace change, so every catastrophic syscall stays
-  killed and everything unlisted stays `EPERM` inside the new namespace. The
-  residual is that userns-dependent kernel attack surface stays reachable. We
-  keep `clone3` open because denying it breaks thread creation: an strace of a
-  jailed index under the no-JIT build shows qemu spawning hundreds of helper
-  threads via `clone3` after the jail has latched, so it is genuinely required.
+- `clone3` and the namespace surface. `clone3`'s flags live in a struct behind a
+  pointer a seccomp BPF filter cannot dereference, so unlike `clone` it can't be
+  flag-filtered to forbid `CLONE_NEWUSER`. Rather than allow it unconditionally
+  (which would leave userns creation reachable), it is turned into `ENOSYS`. glibc
+  falls back to the flag-gated `clone` specifically on `ENOSYS` (not on `EPERM`),
+  so thread creation still works, qemu's post-lockdown helper threads included,
+  while `clone3(CLONE_NEWUSER)` returns `ENOSYS` instead of making a namespace.
+  The jail tests assert both halves (threads still spawn; a raw
+  `clone3(CLONE_NEWUSER)` comes back `ENOSYS`, not success and not `EPERM`). The
+  residual that remains is the ordinary one: this is defense against a userns
+  entry gadget, not a claim that the kernel's namespace code is unreachable by
+  other means; `unshare`/`setns`/flagged `clone` are all killed or denied too.
 - x32 ABI. The kill list now covers the x32 form of every catastrophic syscall
   (the `0x40000000` bit set, plus the dedicated x32 numbers for the struct-passing
   calls like `execve`/`ptrace`/the `*msg` family), so an x32 escape attempt

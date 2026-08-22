@@ -10,7 +10,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: deps
-        run: sudo apt-get update && sudo apt-get install -y libunicorn-dev libcapstone-dev
+        # build from source only: cmake + a C/C++ toolchain, NOT libunicorn-dev /
+        # libcapstone-dev. the no-JIT guarantee needs unicorn built from the TCI
+        # fork; a system libunicorn in the image would let an accidental switch to a
+        # dynamic/system link succeed silently and reintroduce the JIT code buffer.
+        # with no system lib present, any such regression fails the build loudly.
+        run: sudo apt-get update && sudo apt-get install -y cmake
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

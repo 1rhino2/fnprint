@@ -11,8 +11,29 @@
 //   "mprotect_exec" -> flipping a page to executable must be denied. exit 0 if
 //               denied, 3 if the flip succeeded (hole), 4 if the setup RW map
 //               failed.
+//   "thread" -> spawning a thread must still work post-lockdown. glibc issues
+//               clone3 first and we ENOSYS it, so this proves the fallback to the
+//               flag-gated clone works. exit 0 if the thread ran, 5 if not.
+//   "userns" -> raw clone3(CLONE_NEWUSER) must be denied as ENOSYS (which is what
+//               routes glibc to the clone fallback), NOT allowed and NOT EPERM.
+//               exit 0 if ENOSYS, 3 if it created anything (hole), 4 if some other
+//               errno (e.g. EPERM, which would break thread creation).
 //   "ok"     -> allowed compute+write path, exit 0.
 use std::process::exit;
+
+const CLONE_NEWUSER: u64 = 0x1000_0000;
+
+#[repr(C)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+}
 
 // this probe issues raw mmap/mprotect to prove the jail denies executable pages.
 // there is no safe-Rust way to request PROT_EXEC, so the calls are unsafe. they
@@ -91,6 +112,49 @@ fn main() {
                 exit(3); // flip to executable succeeded: containment hole
             }
             exit(0);
+        }
+        "thread" => {
+            // thread creation must survive the clone3->ENOSYS routing. std::thread
+            // -> pthread_create -> clone3 (ENOSYS) -> clone fallback (flag-gated,
+            // no CLONE_NEW* so allowed).
+            let h = std::thread::spawn(|| 40u64 + 2);
+            match h.join() {
+                Ok(42) => exit(0),
+                _ => exit(5),
+            }
+        }
+        "userns" => {
+            // raw clone3 asking for a new user namespace. must come back ENOSYS so
+            // glibc would fall back to the flag-gated clone; anything else is wrong.
+            let args = CloneArgs {
+                flags: CLONE_NEWUSER,
+                pidfd: 0,
+                child_tid: 0,
+                parent_tid: 0,
+                exit_signal: libc::SIGCHLD as u64,
+                stack: 0,
+                stack_size: 0,
+                tls: 0,
+            };
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_clone3,
+                    &args as *const CloneArgs,
+                    std::mem::size_of::<CloneArgs>(),
+                )
+            };
+            if ret == 0 {
+                // we are an unexpected child in a new userns: containment hole.
+                unsafe { libc::_exit(3) };
+            }
+            if ret > 0 {
+                exit(3); // parent: a child was created, hole
+            }
+            let err = unsafe { *libc::__errno_location() };
+            if err == libc::ENOSYS {
+                exit(0); // denied exactly as intended
+            }
+            exit(4); // some other errno (EPERM would break glibc's fallback)
         }
         _ => {
             // allowed path: a little compute, write already proven by "locked"

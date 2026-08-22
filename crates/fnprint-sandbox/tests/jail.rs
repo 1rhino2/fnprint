@@ -77,3 +77,35 @@ fn exec_mprotect_is_denied() {
         "flipping a page to executable must be denied"
     );
 }
+
+#[test]
+fn thread_creation_survives_clone3_enosys() {
+    // clone3 is ENOSYS'd, so thread creation must fall back to the flag-gated
+    // clone. if the fallback broke, this hangs or the probe exits 5.
+    let st = run("thread");
+    assert_eq!(
+        st.signal(),
+        None,
+        "thread spawn must not hard-kill the worker"
+    );
+    assert_eq!(
+        st.code(),
+        Some(0),
+        "spawning a thread must still work after clone3 is ENOSYS'd"
+    );
+}
+
+#[test]
+fn clone3_userns_is_enosys() {
+    // clone3(CLONE_NEWUSER) must come back ENOSYS (not success, not EPERM). ENOSYS
+    // is what shuts off userns creation via clone3 while still letting glibc fall
+    // back to the flag-gated clone. exit 3 = a child/namespace was created (hole),
+    // 4 = wrong errno (EPERM would break thread creation).
+    let st = run("userns");
+    assert_eq!(st.signal(), None, "clone3 userns probe must not hard-kill");
+    assert_eq!(
+        st.code(),
+        Some(0),
+        "clone3(CLONE_NEWUSER) must be denied as ENOSYS"
+    );
+}

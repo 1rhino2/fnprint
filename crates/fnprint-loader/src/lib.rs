@@ -180,6 +180,26 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
     })
 }
 
+// a crafted ELF can point thousands of symbols at one long strtab run, so cloning
+// each name would be (symbol count * name length) bytes: a small file forcing a
+// huge allocation. cap both. real binaries are far under these (libcrypto ~6k
+// functions, symbol names tens of bytes); a name past the cap is truncated, and we
+// stop after MAX_FUNCS symbols. the segment loader's own MAX_TOTAL_MEM does not
+// cover the symbol table, so this is where that amplification is bounded.
+const MAX_NAME: usize = 4096;
+const MAX_FUNCS: usize = 1_000_000;
+
+fn clamp_name(s: &str) -> String {
+    if s.len() <= MAX_NAME {
+        return s.to_string();
+    }
+    let mut end = MAX_NAME;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 fn discover(elf: &Elf, raw: &[u8]) -> Result<Vec<Func>> {
     let mut out = Vec::new();
 
@@ -189,6 +209,9 @@ fn discover(elf: &Elf, raw: &[u8]) -> Result<Vec<Func>> {
         .map(|s| (s, FuncSource::Symtab))
         .chain(elf.dynsyms.iter().map(|s| (s, FuncSource::DynSym)))
     {
+        if out.len() >= MAX_FUNCS {
+            break; // pathological symbol count; stop rather than amplify
+        }
         if sym.st_type() != goblin::elf::sym::STT_FUNC {
             continue;
         }
@@ -199,7 +222,7 @@ fn discover(elf: &Elf, raw: &[u8]) -> Result<Vec<Func>> {
             FuncSource::Symtab => elf.strtab.get_at(sym.st_name),
             _ => elf.dynstrtab.get_at(sym.st_name),
         }
-        .map(|s| s.to_string())
+        .map(clamp_name)
         .filter(|s| !s.is_empty());
         out.push(Func {
             name,

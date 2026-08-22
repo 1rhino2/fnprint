@@ -121,8 +121,16 @@ mod linux {
             // thread creation for rayon + qemu helper threads. execve is NOT
             // allowed, so a clone/fork can only ever produce another jailed copy.
             // SYS_clone is added separately in build_allow_filter with a flag
-            // condition (no CLONE_NEW*). clone3 stays unconditional: its flags
-            // live in a struct behind a pointer that BPF cannot dereference.
+            // condition (no CLONE_NEW*). clone3's flags live in a struct behind a
+            // pointer BPF cannot dereference, so it can't be flag-gated the same
+            // way. we keep it in this allow set (so the allow filter returns ALLOW
+            // for it, not EPERM) but a separate stacked filter forces it to ENOSYS
+            // (see clone3_enosys_filter): glibc's pthread_create tries clone3 first
+            // and falls back to the flag-gated clone specifically on ENOSYS, so
+            // threads keep working while CLONE_NEWUSER via clone3 is shut off. it
+            // MUST stay listed here: on EPERM glibc does not fall back and thread
+            // creation breaks, and the ENOSYS filter only wins over the allow
+            // filter's ALLOW, not over an EPERM.
             libc::SYS_clone3,
             libc::SYS_set_robust_list,
             libc::SYS_get_robust_list,
@@ -249,6 +257,19 @@ mod linux {
             libc::SYS_io_uring_register,
             libc::SYS_userfaultfd,
             libc::SYS_pidfd_getfd,
+            // the new mount API (fsopen/fsconfig/fsmount/move_mount/open_tree/
+            // fspick) is the modern equivalent of mount/umount/pivot_root, which we
+            // already hard-kill. the worker never touches any of it, so treat an
+            // attempt as the same unambiguous escape probe and kill, not just soft-
+            // deny (EPERM). raw numbers: the libc crate does not expose SYS_ consts
+            // for these on all targets. x86_64: open_tree=428, move_mount=429,
+            // fsopen=430, fsconfig=431, fsmount=432, fspick=433.
+            428,
+            429,
+            430,
+            431,
+            432,
+            433,
         ];
         // kill the x32 form of every native catastrophic call, plus the dedicated
         // x32 numbers for the struct-passing ones.
@@ -302,6 +323,13 @@ mod linux {
         SeccompRule::new(vec![cond]).context("prot no-exec rule")
     }
 
+    // note on the i386 / int 0x80 compat ABI: we never list it, and don't need to.
+    // seccompiler prepends an arch-validation preamble to every filter built for
+    // TargetArch::x86_64 that returns KILL_PROCESS for any arch != AUDIT_ARCH_X86_64.
+    // an int 0x80 enters as AUDIT_ARCH_I386, so both stacked filters hard-kill it,
+    // the whole i386 syscall space, not just our catastrophic set. that kill rides
+    // on seccompiler's preamble; if the crate is ever swapped, re-check that an
+    // i386 syscall is still killed and not silently soft-denied.
     fn build_filter(
         syscalls: Vec<i64>,
         matched: SeccompAction,
@@ -329,6 +357,29 @@ mod linux {
         filter.try_into().context("compile allow filter")
     }
 
+    // ENOSYS(38). a one-syscall filter that turns clone3 into ENOSYS. it can't
+    // gate clone3 by flags (they're behind a pointer BPF can't read), so instead
+    // it makes clone3 look unimplemented, which routes glibc's pthread_create to
+    // the flag-gated clone fallback (glibc falls back only on ENOSYS, not EPERM).
+    // default is Allow so it doesn't touch any other syscall and doesn't block the
+    // seccomp() needed to install later filters. it wins over the allow filter's
+    // ALLOW for clone3 by most-severe-wins (ERRNO beats ALLOW, the same precedence
+    // that makes the allow filter's EPERM default work); it does NOT rely on any
+    // ERRNO-vs-ERRNO tie, which is why clone3 must stay in the allow set (ALLOW,
+    // not EPERM) rather than being removed from it.
+    fn build_clone3_enosys_filter() -> Result<BpfProgram> {
+        let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
+            [(libc::SYS_clone3, vec![])].into_iter().collect();
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(38),
+            TargetArch::x86_64,
+        )
+        .context("build clone3 enosys filter")?;
+        filter.try_into().context("compile clone3 enosys filter")
+    }
+
     fn install_seccomp() -> Result<()> {
         // EPERM(1): the soft-deny errno for anything not explicitly allowed.
         let eperm = SeccompAction::Errno(1);
@@ -338,14 +389,16 @@ mod linux {
             SeccompAction::KillProcess,
             SeccompAction::Allow,
         )?;
+        let clone3_enosys = build_clone3_enosys_filter()?;
         // most-severe-wins: the kernel keeps every installed filter and runs all
         // of them per syscall, so runtime order is irrelevant. INSTALL order is
         // not: TSYNC needs the seccomp() syscall, which the EPERM-default allow
-        // filter does not permit, so the allow filter must go on SECOND while the
-        // kill filter (default-allow) still lets seccomp() through. if the second
-        // apply fails, lock_down_worker returns Err and the worker aborts before
-        // reading any input, so the transient kill-only posture never sees
-        // untrusted bytes (fail-closed is the caller's abort, not filter order).
+        // filter does not permit, so the allow filter must go on LAST while the
+        // other two (both default-allow) still let seccomp() through. if any apply
+        // fails, lock_down_worker returns Err and the worker aborts before reading
+        // any input, so the transient posture never sees untrusted bytes
+        // (fail-closed is the caller's abort, not filter order).
+        apply_filter_all_threads(&clone3_enosys).context("apply clone3 enosys filter")?;
         apply_filter_all_threads(&kill).context("apply kill filter")?;
         install_program(&allow)
     }

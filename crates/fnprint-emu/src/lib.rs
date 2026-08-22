@@ -40,8 +40,10 @@ pub struct Config {
     pub instr_cap: u64,
     pub visit_cap: u32,
     /// wall-clock backstop only, NOT a fingerprint-shaping bound. termination is
-    /// bounded deterministically by instr_cap + visit_cap + max_effects; this
-    /// just catches a genuine unicorn hang. keep it big so it never fires under
+    /// bounded deterministically by instr_cap + visit_cap + max_effects, plus a
+    /// per-run mem-op ceiling (instr_cap * MEM_OPS_PER_INSTR_CAP) that stops a
+    /// single rep-prefixed string op without leaning on this timer; this just
+    /// catches a genuine unicorn hang. keep it big so it never fires under
     /// parallel CPU load, otherwise it truncates traces and the same binary
     /// fingerprints differently run to run.
     pub timeout_us: u64,
@@ -101,7 +103,21 @@ struct Rec {
     // regions a context can hold, so we stop mapping past a limit and let the
     // run end capped instead of letting unicorn abort the whole process.
     map_count: usize,
+    // total mem-hook callbacks (reads + writes) this run. a single rep-prefixed
+    // string op is ONE instruction (so instr_cap/visit_cap count it once) but
+    // fires a mem hook per iteration with RCX seeded huge. the write side is
+    // bounded by max_effects, but reads dedup and never grow effects, so a pure
+    // read rep (rep lodsb/scasb/cmpsb) would otherwise run to RCX exhaustion,
+    // bounded only by the wall-clock timeout. this counter bounds it
+    // deterministically, independent of wall time.
+    mem_op_iters: u64,
 }
+
+// deterministic ceiling on mem-hook callbacks per run, as a multiple of the
+// instruction cap. a legit function does only a handful of memory ops per
+// instruction, so instr_cap * this is far above any real run while still stopping
+// a single rep string op in bounded, wall-clock-independent time.
+const MEM_OPS_PER_INSTR_CAP: u64 = 64;
 
 impl Rec {
     fn arg_base(k: usize) -> u64 {
@@ -285,6 +301,7 @@ impl MicroExec {
             natural_dirs: Vec::new(),
             pending_branch: None,
             map_count: 0,
+            mem_op_iters: 0,
         };
 
         let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, rec)?;
@@ -391,6 +408,21 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
         0,
         u64::MAX,
         |uc, _ty, addr, _size, _val| {
+            // reads dedup and never grow effects, so max_effects can't stop a pure
+            // read rep (rep lodsb/scasb/cmpsb): one instruction, RCX seeded huge,
+            // a callback per iteration. bound the total mem-op callbacks so it
+            // stops deterministically instead of running to the wall-clock timeout.
+            {
+                let rec = uc.get_data_mut();
+                rec.mem_op_iters += 1;
+                if rec.mem_op_iters >= rec.cfg.instr_cap.saturating_mul(MEM_OPS_PER_INSTR_CAP) {
+                    rec.capped = true;
+                }
+            }
+            if uc.get_data().capped {
+                uc.emu_stop().ok();
+                return true;
+            }
             let rec = uc.get_data_mut();
             rec.note_new_region(addr);
             let (region, off) = rec.classify_addr(addr);
@@ -419,7 +451,10 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
             // to millions from a 2-byte body. cap here too and stop the run.
             {
                 let rec = uc.get_data_mut();
-                if rec.effects.len() >= rec.cfg.max_effects {
+                rec.mem_op_iters += 1;
+                if rec.effects.len() >= rec.cfg.max_effects
+                    || rec.mem_op_iters >= rec.cfg.instr_cap.saturating_mul(MEM_OPS_PER_INSTR_CAP)
+                {
                     rec.capped = true;
                 }
             }
@@ -806,6 +841,25 @@ mod tests {
             t.effects.len()
         );
         assert!(t.capped, "rep flood should mark the trace capped");
+    }
+
+    #[test]
+    fn rep_read_flood_is_capped() {
+        // `rep lodsb` (f3 ac) is ONE read-only instruction repeated RCX times with
+        // RCX seeded huge. reads dedup, so max_effects can't stop it; the mem-op
+        // ceiling (instr_cap * MEM_OPS_PER_INSTR_CAP) must, deterministically and
+        // without waiting on the wall-clock timeout. small instr_cap makes that
+        // ceiling the binding bound. f3 ac = rep lodsb ; c3 ret.
+        let code = [0xf3, 0xac, 0xc3];
+        let cfg = Config {
+            instr_cap: 10,
+            ..Config::default()
+        };
+        let t = MicroExec::new(cfg).run(&img(&code), &f(), &HashMap::new());
+        assert!(
+            t.capped,
+            "pure-read rep flood should be capped by the mem-op ceiling"
+        );
     }
 
     #[test]

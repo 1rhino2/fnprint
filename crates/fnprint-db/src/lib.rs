@@ -173,15 +173,23 @@ impl Db {
             }
         }
         let mut row_st = self.conn.prepare(
+            // same absurd-text guard as all(): a crafted corpus row with a huge
+            // binary/name/source string is skipped in sqlite before we materialize
+            // it, not just dropped after the alloc. keeps this path (index --out +
+            // tests) consistent with all()'s defense in depth.
             "SELECT id,binary,name,entry,source,complexity,shingles,capped,sig
-             FROM funcs WHERE id=?1 AND length(sig)=?2",
+             FROM funcs
+             WHERE id=?1 AND length(sig)=?2
+               AND length(binary)<=?3
+               AND (name IS NULL OR length(name)<=?3)
+               AND length(source)<=?3",
         )?;
         let mut out = Vec::new();
         for id in ids {
             // a band pointing at a missing or wrong-sized row (corrupt/crafted
             // db) is skipped, not a hard error that kills the whole query.
             match row_st
-                .query_row(params![id, SIG_BYTES], |r| Ok(row_to_rec(r)))
+                .query_row(params![id, SIG_BYTES, MAX_TEXT], |r| Ok(row_to_rec(r)))
                 .optional()?
             {
                 Some(rec) => out.push(rec?),
@@ -283,10 +291,14 @@ impl Corpus for MemCorpus {
 
 fn row_to_rec(r: &rusqlite::Row) -> Result<FuncRec> {
     let sig: Vec<u8> = r.get(8)?;
+    // a crafted corpus can store negative/huge shingles/complexity; clamp with
+    // try_from so a bogus row degrades to a low-signal 0 instead of wrapping to
+    // u32::MAX (which would sail past the complexity signal gate). these only feed
+    // scoring gates, never an index/alloc, so this is tidiness, not a safety fix.
     let fp = Fingerprint {
         sig: decode_sig(&sig),
-        shingles: r.get::<_, i64>(6)? as u32,
-        complexity: r.get::<_, i64>(5)? as u32,
+        shingles: u32::try_from(r.get::<_, i64>(6)?).unwrap_or(0),
+        complexity: u32::try_from(r.get::<_, i64>(5)?).unwrap_or(0),
         capped: r.get::<_, i64>(7)? != 0,
     };
     Ok(FuncRec {

@@ -19,16 +19,19 @@ use serde::{Deserialize, Serialize};
 // treat as a compromised worker.
 const MAX_INPUT: u64 = 512 << 20; // 512 MiB
                                   // the reply is fingerprints, far smaller than the input binary, so cap it well
-                                  // below the input. a compromised worker can amplify the wire size on decode:
-                                  // postcard varint-decodes each zero u64 (1 wire byte) into 8 resident bytes,
-                                  // and the Vec<String>/Vec<FuncRec> shapes add per-element String/struct
-                                  // overhead on top, so the real worst case is ~24x, not 8x: a full 128 MiB
-                                  // reply can balloon to roughly 3 GiB transient in the parent before it is
-                                  // dropped. that is a compromised-worker-only DoS (the jail already held), it
-                                  // stays bounded by the parent's own RLIMIT_AS, and 128 MiB still fits any
-                                  // realistic binary's prints (~400k functions). we keep the cap here rather
-                                  // than lower it (a smaller cap would false-reject a legit large binary's
-                                  // reply as if the worker were compromised).
+                                  // below the input. this wire cap (enforced by the take(MAX_REPLY+1) read) is
+                                  // the only bound on the reply: the parent sets no RLIMIT_AS on itself (setrlimit
+                                  // only runs inside the jailed worker), so nothing else catches an oversized
+                                  // decode. a compromised worker can amplify the wire size on decode: postcard
+                                  // varint-decodes each zero u64 (1 wire byte) into 8 resident bytes, and the
+                                  // Vec<String>/Vec<FuncRec> shapes add per-element String/struct overhead on top,
+                                  // so the real worst case is ~24x: a full 128 MiB reply can balloon to roughly
+                                  // 3 GiB transient in the parent before validate_* rejects it. that is the
+                                  // accepted residual here - a compromised-worker-only transient spike (the jail
+                                  // already held to let it get popped), not a persistent leak. we keep the cap at
+                                  // 128 MiB rather than lower it (a smaller cap would false-reject a legit large
+                                  // binary's prints) and rather than add a parent RLIMIT_AS (which would risk
+                                  // false-killing a legitimately large in-memory corpus build).
 const MAX_REPLY: u64 = 128 << 20;
 
 // the hidden argv token the parent re-execs itself with to become the jailed
@@ -376,10 +379,7 @@ fn load_corpus_records(path: &str, no_sandbox: bool) -> Result<Vec<FuncRec>> {
             .with_context(|| format!("opening corpus {path}"))?
             .all();
     }
-    let bytes = fs::read(path).with_context(|| format!("reading corpus {path}"))?;
-    if bytes.len() as u64 > MAX_INPUT {
-        bail!("corpus {path} over size cap");
-    }
+    let bytes = read_input(path)?;
     match run_worker("dbload", None, &bytes)? {
         WorkerReply::DbOk(recs) => {
             validate_corpus_records(&recs)?;
@@ -400,6 +400,27 @@ fn load_corpus(path: &str, no_sandbox: bool) -> Result<MemCorpus> {
     )?))
 }
 
+// read a file we're about to hand the jailed worker, refusing anything over
+// MAX_INPUT. check metadata first so a huge file can't OOM the parent on the read
+// itself (the worker's own stdin cap only fires after the parent holds the bytes).
+// metadata is best-effort (a proc/pipe path may report 0), so the post-read length
+// check stays as the backstop.
+fn read_input(path: &str) -> Result<Vec<u8>> {
+    if let Ok(md) = fs::metadata(path) {
+        if md.len() > MAX_INPUT {
+            bail!(
+                "{path} is {} bytes, over the {MAX_INPUT} byte cap",
+                md.len()
+            );
+        }
+    }
+    let bytes = fs::read(path).with_context(|| format!("reading {path}"))?;
+    if bytes.len() as u64 > MAX_INPUT {
+        bail!("{path} over the {MAX_INPUT} byte cap");
+    }
+    Ok(bytes)
+}
+
 // load an index from either an ELF (jailed emulation) or a prebuilt db (jailed
 // sqlite parse). in both cases the untrusted bytes are parsed behind the jail.
 fn load_index(path: &str, no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
@@ -414,13 +435,13 @@ fn load_index(path: &str, no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
             })
             .collect())
     } else {
-        let bytes = fs::read(path).with_context(|| format!("reading {path}"))?;
+        let bytes = read_input(path)?;
         run_index(&bytes, no_sandbox)
     }
 }
 
 fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool) -> Result<()> {
-    let bytes = fs::read(binary).with_context(|| format!("reading {binary}"))?;
+    let bytes = read_input(binary)?;
     let funcs = run_index(&bytes, no_sandbox)?;
     let label = Path::new(binary)
         .file_name()
@@ -578,7 +599,7 @@ fn cmd_triage(
 }
 
 fn cmd_dump(binary: &str, func: &str, no_sandbox: bool) -> Result<()> {
-    let bytes = fs::read(binary).with_context(|| format!("reading {binary}"))?;
+    let bytes = read_input(binary)?;
     let lines = run_dump(&bytes, func, no_sandbox)?;
     for line in &lines {
         println!("{}", esc(line));
