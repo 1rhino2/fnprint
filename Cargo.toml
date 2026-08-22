@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -23,14 +23,14 @@ anyhow = "1"
 goblin = "0.8"
 gimli = "0.31"
 capstone = "0.14"
-# x86-only: fnprint only emulates x86-64, so ask unicorn to build just the x86 TCG
-# backend and skip the other 9 arches, shrinking the native attack surface.
-# caveat: unicorn-engine-sys links a system libunicorn via pkg-config when one is
-# present (e.g. libunicorn-dev), and that prebuilt lib is all-arch, so the trim
-# only actually takes effect on a from-source build with no system unicorn in the
-# build env. harmless when it doesn't apply; the seccomp jail is the real
-# containment regardless.
-unicorn-engine = { version = "2.1", default-features = false, features = ["arch_x86"] }
+# no-JIT (TCI) unicorn fork: builds unicorn from source with the tiny code
+# interpreter (no host codegen -> no executable page needed) and x86-only TCG.
+# this is what lets the seccomp jail forbid PROT_EXEC outright (see SECURITY.md).
+# the fork always builds from source, so unlike the stock crate it never links an
+# ambient system libunicorn, and both the exec-free guarantee and the arch trim
+# actually apply. published as unicorn-engine-tci + unicorn-engine-sys-tci
+# (GPL-2.0) from github.com/1rhino2/unicorn-tci, pinned to 2.1.5.
+unicorn-engine = { package = "unicorn-engine-tci", version = "=2.1.5", default-features = false, features = ["arch_x86"] }
 # serialize gives sqlite3_deserialize, used to parse a corpus .db entirely in
 # memory inside the jailed worker (no file open), see fnprint-db::Db::open_image.
 rusqlite = { version = "0.31", features = ["bundled", "serialize"] }
@@ -50,10 +50,12 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# the workspace is unsafe-forbid everywhere except fnprint-db, which carries one
-# audited unsafe FFI shim (sqlite3_malloc for deserialize; it has its own
-# [lints] setting unsafe_code = "deny" plus a single scoped #[allow]). the only
-# native memory lives inside the unicorn/capstone/sqlite C libs, not our code.
+# the workspace is unsafe-forbid everywhere except two crates that set their own
+# [lints] to unsafe_code = "deny" plus a single scoped #[allow]: fnprint-db (one
+# audited sqlite3_malloc FFI shim for deserialize) and fnprint-sandbox (only its
+# jailbreak_probe test binary, which needs raw mmap/mprotect to prove the
+# PROT_EXEC deny; the sandbox library itself is unsafe-free). the only native
+# memory lives inside the unicorn/capstone/sqlite C libs, not our code.
 # also ban the panic-macro family so no parse path can grow a panic (none today).
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -7,9 +7,12 @@
 //! socket family, module/kexec/bpf, mount/chroot/namespace, the setuid family)
 //! hard-kill the process; anything else not on the small allow set fails soft
 //! with EPERM. A popped worker can compute in its own address space but cannot
-//! open a file, touch the network, or exec anything. It can still spawn threads
-//! (unicorn/qemu needs to), but a fork only yields another copy of this same
-//! jail, and with execve killed that copy can't become anything else.
+//! open a file, touch the network, or exec anything. Because we link a no-JIT
+//! (interpreted) unicorn, mmap/mprotect are also allowed only without PROT_EXEC,
+//! so the worker cannot even make an executable page: it can't run code it
+//! generates, only interpret the target through the emulator. It can still spawn
+//! threads (unicorn/qemu needs to), but a fork only yields another copy of this
+//! same jail, and with execve killed that copy can't become anything else.
 //!
 //! Linux only. On any other OS `lock_down_worker` returns Err so the caller
 //! fails closed (no jail, no untrusted work) unless the user opted out.
@@ -24,8 +27,25 @@ mod linux {
     };
 
     // hard ceilings the worker can't exceed even if an emulation cap is missed.
-    const MAX_CPU_SECS: u64 = 120; // wall-CPU backstop to the instr cap
+    // RLIMIT_CPU sums CPU across every thread, and we emulate the target's
+    // functions in parallel, so honest aggregate work on a large binary
+    // (libcrypto-scale, ~6k functions) times the core count adds up fast. a flat
+    // total would shrink in wall-time terms as cores grow and could kill a big
+    // legit index. so scale the backstop with the thread count: it stays a
+    // consistent "this many wall-seconds of runaway" ceiling, not a fixed total.
+    // this is a backstop behind the per-function instr cap and emu_start timeout,
+    // not the primary guard. the interpreter (no-JIT) build costs about the same
+    // CPU as the old JIT build on this bounded, instr-capped workload, so the
+    // wall budget did not need widening for TCI, only decoupling from core count.
+    const CPU_BACKSTOP_WALL_SECS: u64 = 120;
     const GIB: u64 = 1 << 30;
+
+    fn cpu_time_cap() -> u64 {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(8);
+        CPU_BACKSTOP_WALL_SECS.saturating_mul(threads)
+    }
 
     // RLIMIT_AS bounds VIRTUAL address space, and every parallel unicorn instance
     // reserves a big (mostly non-resident) TCG translation buffer in the shared
@@ -58,7 +78,7 @@ mod linux {
         //    fd, not a disk-write the worker opened.
         setrlimit(Resource::Core, cap(0)).context("rlimit core")?;
         setrlimit(Resource::As, cap(addr_space_cap())).context("rlimit as")?;
-        setrlimit(Resource::Cpu, cap(MAX_CPU_SECS)).context("rlimit cpu")?;
+        setrlimit(Resource::Cpu, cap(cpu_time_cap())).context("rlimit cpu")?;
         setrlimit(Resource::Nofile, cap(64)).context("rlimit nofile")?;
         Ok(())
     }
@@ -78,9 +98,13 @@ mod linux {
     // from taking the whole run down.
 
     // the syscalls the worker legitimately needs to SUCCEED: read/write on the
-    // inherited pipes, the memory syscalls unicorn's TCG JIT and our allocator
-    // use, thread creation + futex for rayon and qemu's helper threads,
-    // scheduling, signals, time, randomness, and exit.
+    // inherited pipes, the memory syscalls our allocator and the emulator's
+    // interpreted (no-JIT) code buffer use, thread creation + futex for rayon and
+    // qemu's helper threads, scheduling, signals, time, randomness, and exit.
+    // mmap and mprotect are deliberately NOT here: build_allow_filter adds them
+    // with a PROT_EXEC-absent condition. we link a no-JIT (TCI) unicorn, so the
+    // emulator never needs an executable page, and a popped worker must not be
+    // able to make one.
     fn allowed_syscalls() -> Vec<i64> {
         vec![
             libc::SYS_read,
@@ -89,9 +113,7 @@ mod linux {
             libc::SYS_writev,
             libc::SYS_close,
             libc::SYS_lseek,
-            libc::SYS_mmap,
             libc::SYS_munmap,
-            libc::SYS_mprotect,
             libc::SYS_mremap,
             libc::SYS_madvise,
             libc::SYS_brk,
@@ -259,6 +281,27 @@ mod linux {
         SeccompRule::new(vec![cond]).context("clone flag rule")
     }
 
+    // PROT_EXEC. mmap and mprotect both take prot as arg2 on x86_64. we link a
+    // no-JIT (TCI) unicorn whose code buffer is mapped read+write only, so the
+    // emulator never needs an executable page. allow these two only when
+    // PROT_EXEC is clear; a PROT_EXEC request matches no rule and falls through
+    // to the allow filter default (EPERM), the same soft-deny path a namespace
+    // clone takes. net effect: a popped worker cannot map new executable memory
+    // or flip an existing page to executable, so it cannot run code it generates.
+    const PROT_EXEC: u64 = 0x4;
+
+    fn prot_no_exec_rule() -> Result<seccompiler::SeccompRule> {
+        use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
+        let cond = SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(PROT_EXEC),
+            0,
+        )
+        .context("prot no-exec condition")?;
+        SeccompRule::new(vec![cond]).context("prot no-exec rule")
+    }
+
     fn build_filter(
         syscalls: Vec<i64>,
         matched: SeccompAction,
@@ -279,6 +322,8 @@ mod linux {
             .map(|nr| (nr, vec![]))
             .collect();
         rules.insert(libc::SYS_clone, vec![clone_flag_rule()?]);
+        rules.insert(libc::SYS_mmap, vec![prot_no_exec_rule()?]);
+        rules.insert(libc::SYS_mprotect, vec![prot_no_exec_rule()?]);
         let filter = SeccompFilter::new(rules, default, SeccompAction::Allow, TargetArch::x86_64)
             .context("build allow filter")?;
         filter.try_into().context("compile allow filter")
@@ -314,7 +359,31 @@ mod linux {
         Ok(())
     }
 
+    // defense in depth behind the PROT_EXEC seccomp deny. the filter stops the
+    // worker from creating NEW executable memory; this confirms there is no
+    // pre-existing writable+executable page to scribble shellcode into either. a
+    // healthy Rust+glibc worker has none (the emulator is not instantiated until
+    // after lockdown, and the no-JIT unicorn maps its code buffer read+write
+    // only). if a W^X page is somehow present, fail closed rather than jail over
+    // it. must run before install_seccomp, while reading /proc/self/maps is still
+    // allowed (openat is EPERM-denied once the filters are on).
+    fn assert_no_wx_mappings() -> Result<()> {
+        let maps = std::fs::read_to_string("/proc/self/maps").context("read /proc/self/maps")?;
+        for line in maps.lines() {
+            // "addr perms offset dev inode path"; perms is field 2, e.g. "rwxp".
+            if let Some(perms) = line.split_whitespace().nth(1) {
+                let b = perms.as_bytes();
+                if b.len() >= 3 && b[1] == b'w' && b[2] == b'x' {
+                    anyhow::bail!("refusing to jail: writable+executable mapping present: {line}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn lock_down_worker() -> Result<()> {
+        // check for W^X while open() still works, before any filter is installed.
+        assert_no_wx_mappings()?;
         set_rlimits()?;
         // required before SECCOMP_SET_MODE_FILTER without CAP_SYS_ADMIN, and it
         // also means a jailed exploit can't gain privs via a setuid helper.

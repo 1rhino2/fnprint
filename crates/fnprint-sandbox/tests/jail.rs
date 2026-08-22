@@ -50,3 +50,30 @@ fn file_open_is_denied_but_not_killed() {
     assert_eq!(st.signal(), None, "file open must not hard-kill the worker");
     assert!(st.success(), "probe exits 0 only when the open was denied");
 }
+
+#[test]
+fn exec_mmap_is_denied() {
+    // the core no-JIT guarantee: a worker cannot map an executable page, so a
+    // popped emulator can't run code it generates. denied soft (EPERM), and a
+    // plain read/write mmap still works. exit 3 = exec page granted (hole),
+    // 4 = we broke non-exec mmap.
+    let st = run("mmap_exec");
+    assert_eq!(st.signal(), None, "PROT_EXEC mmap must not hard-kill");
+    assert_eq!(
+        st.code(),
+        Some(0),
+        "PROT_EXEC mmap must be denied while plain mmap still works"
+    );
+}
+
+#[test]
+fn exec_mprotect_is_denied() {
+    // the other half: a worker cannot flip an existing page to executable.
+    let st = run("mprotect_exec");
+    assert_eq!(st.signal(), None, "PROT_EXEC mprotect must not hard-kill");
+    assert_eq!(
+        st.code(),
+        Some(0),
+        "flipping a page to executable must be denied"
+    );
+}

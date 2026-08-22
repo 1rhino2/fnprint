@@ -20,5 +20,17 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"
 
-[lints]
-workspace = true
+# the library itself is unsafe-free, but the jailbreak_probe test binary must
+# issue raw mmap/mprotect to prove the PROT_EXEC deny, and there is no safe-Rust
+# way to request an executable page. so this crate is `deny` (not the workspace
+# `forbid`) with one scoped `#[allow]` in the probe, same pattern as fnprint-db.
+# deny still errors on any unsafe in the library.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+mem_forget = "deny"
