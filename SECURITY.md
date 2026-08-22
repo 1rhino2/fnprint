@@ -102,11 +102,12 @@ These are understood and accepted, not oversights:
   killed and everything unlisted stays `EPERM` inside the new namespace. The
   residual is that userns-dependent kernel attack surface stays reachable. We
   keep `clone3` open because denying it breaks thread creation on current glibc.
-- x32 ABI. The kill-list tripwire matches native x86-64 syscall numbers; an x32
-  call (syscall bit `0x40000000`) misses both lists and lands on the allow
-  filter's `EPERM` default. So x32 catastrophic calls are still contained (they
-  fail), but they return `EPERM` rather than `SIGSYS`, so a monitor keying on
-  `SIGSYS` won't see them. The i386/`int 0x80` compat gate is hard-killed.
+- x32 ABI. The kill list now covers the x32 form of every catastrophic syscall
+  (the `0x40000000` bit set, plus the dedicated x32 numbers for the struct-passing
+  calls like `execve`/`ptrace`/the `*msg` family), so an x32 escape attempt
+  hard-kills (`SIGSYS`) the same as its native counterpart, not just soft-denies.
+  The worker is native x86-64 and issues no x32 calls of its own, so this only
+  sharpens the tripwire. The i386/`int 0x80` compat gate is hard-killed too.
 - One `unsafe` FFI block exists, in `fnprint-db::owned_from_bytes`. `deserialize`
   takes ownership of a buffer SQLite will later free, so the buffer must come from
   `sqlite3_malloc`; there is no safe constructor for it from a `&[u8]`. The block

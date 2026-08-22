@@ -137,8 +137,35 @@ mod linux {
     // proc), the whole socket family (network exfil / c2), module + kexec + bpf +
     // perf (kernel), mount / chroot / pivot_root / unshare / setns (namespace
     // escape), the setuid/setgid family + keyrings (privilege), and a few more.
+    // the x32 ABI enters the same kernel with bit 30 (__X32_SYSCALL_BIT) set on
+    // the syscall number. our worker is pure native x86-64 and never issues an x32
+    // call, so for every catastrophic native syscall we also kill its x32 form.
+    // most x32 numbers are native|bit, but the struct-passing calls (execve,
+    // ptrace, the *msg family, kexec_load, process_vm_*) have dedicated numbers in
+    // the 512+ range, so we add those explicitly too. adding a number that is not
+    // actually a live x32 syscall is a harmless no-op (the worker issues none); a
+    // miss would only drop an x32 catastrophic call onto the allow filter's EPERM
+    // instead of SIGSYS, so it stays contained either way. this only sharpens the
+    // tripwire, it cannot break the worker.
+    const X32_BIT: i64 = 0x4000_0000;
+    // dedicated x32 numbers (pre-bit) for the struct-passing calls in our set,
+    // from the kernel x32 table.
+    const X32_DEDICATED: &[i64] = &[
+        520, // execve
+        545, // execveat
+        521, // ptrace
+        539, // process_vm_readv
+        540, // process_vm_writev
+        518, // sendmsg
+        538, // sendmmsg
+        517, // recvfrom
+        519, // recvmsg
+        537, // recvmmsg
+        528, // kexec_load
+    ];
+
     fn kill_syscalls() -> Vec<i64> {
-        vec![
+        let native = vec![
             libc::SYS_execve,
             libc::SYS_execveat,
             libc::SYS_ptrace,
@@ -200,7 +227,14 @@ mod linux {
             libc::SYS_io_uring_register,
             libc::SYS_userfaultfd,
             libc::SYS_pidfd_getfd,
-        ]
+        ];
+        // kill the x32 form of every native catastrophic call, plus the dedicated
+        // x32 numbers for the struct-passing ones.
+        let mut all = native;
+        let x32: Vec<i64> = all.iter().map(|n| n | X32_BIT).collect();
+        all.extend(x32);
+        all.extend(X32_DEDICATED.iter().map(|n| n | X32_BIT));
+        all
     }
 
     // CLONE_NEW* namespace-creation flags. clone with any of these makes a new

@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -22,8 +22,15 @@ repository = "https://github.com/1rhino2/fnprint"
 anyhow = "1"
 goblin = "0.8"
 gimli = "0.31"
-capstone = "0.12"
-unicorn-engine = "2.1"
+capstone = "0.14"
+# x86-only: fnprint only emulates x86-64, so ask unicorn to build just the x86 TCG
+# backend and skip the other 9 arches, shrinking the native attack surface.
+# caveat: unicorn-engine-sys links a system libunicorn via pkg-config when one is
+# present (e.g. libunicorn-dev), and that prebuilt lib is all-arch, so the trim
+# only actually takes effect on a from-source build with no system unicorn in the
+# build env. harmless when it doesn't apply; the seccomp jail is the real
+# containment regardless.
+unicorn-engine = { version = "2.1", default-features = false, features = ["arch_x86"] }
 # serialize gives sqlite3_deserialize, used to parse a corpus .db entirely in
 # memory inside the jailed worker (no file open), see fnprint-db::Db::open_image.
 rusqlite = { version = "0.31", features = ["bundled", "serialize"] }

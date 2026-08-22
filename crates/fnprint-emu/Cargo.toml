@@ -9,8 +9,8 @@ repository.workspace = true
 [dependencies]
 unicorn-engine = { workspace = true }
 capstone = { workspace = true }
-fnprint-trace = { path = "../fnprint-trace", version = "0.2.4" }
-fnprint-loader = { path = "../fnprint-loader", version = "0.2.4" }
+fnprint-trace = { path = "../fnprint-trace", version = "0.2.5" }
+fnprint-loader = { path = "../fnprint-loader", version = "0.2.5" }
 
 [lints]
 workspace = true
