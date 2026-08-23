@@ -166,6 +166,12 @@ pub struct EffectTrace {
     pub instret: u64,
     /// did we cut it off (loop/instr/time)
     pub capped: bool,
+    /// fraction of the function's own code bytes we actually executed, in [0,1].
+    /// advisory confidence signal: a low value means most of the body sat behind
+    /// branches microexecution never took, so the print reflects little observed
+    /// behavior. surfaced to the analyst; not used to gate a verdict (complex
+    /// input-driven functions legitimately run almost none of their body).
+    pub coverage: f32,
 }
 
 impl EffectTrace {
@@ -251,6 +257,7 @@ mod tests {
             effects: vec![Effect::Ret(ValueClass::Input(0))],
             instret: 2,
             capped: false,
+            coverage: 1.0,
         };
         assert!(thunk.complexity() < 3);
         let real = EffectTrace {
@@ -265,6 +272,7 @@ mod tests {
             ],
             instret: 40,
             capped: false,
+            coverage: 1.0,
         };
         assert!(real.complexity() >= 3);
     }

@@ -103,6 +103,13 @@ struct Rec {
     // regions a context can hold, so we stop mapping past a limit and let the
     // run end capped instead of letting unicorn abort the whole process.
     map_count: usize,
+    // function body range [func_lo, func_hi) and the count of its own code bytes
+    // we executed (each in-range instruction counted once). the ratio to func
+    // size is the coverage signal: a function that hides behavior behind a guard
+    // we never cross shows low coverage.
+    func_lo: u64,
+    func_hi: u64,
+    covered_bytes: u64,
     // total mem-hook callbacks (reads + writes) this run. a single rep-prefixed
     // string op is ONE instruction (so instr_cap/visit_cap count it once) but
     // fires a mem hook per iteration with RCX seeded huge. the write side is
@@ -260,6 +267,7 @@ impl MicroExec {
                     effects: vec![Effect::Capped],
                     instret: 0,
                     capped: true,
+                    coverage: 0.0,
                 },
                 Vec::new(),
             ),
@@ -302,6 +310,9 @@ impl MicroExec {
             pending_branch: None,
             map_count: 0,
             mem_op_iters: 0,
+            func_lo: func.entry,
+            func_hi: func.entry.saturating_add(func.size),
+            covered_bytes: 0,
         };
 
         let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, rec)?;
@@ -340,16 +351,34 @@ impl MicroExec {
         install_hooks(&mut uc)?;
 
         let cfg = self.cfg.clone();
-        let _ = uc.emu_start(func.entry, RET_ADDR, cfg.timeout_us, cfg.instr_cap as usize);
+        let run_res = uc.emu_start(func.entry, RET_ADDR, cfg.timeout_us, cfg.instr_cap as usize);
+        let rip = uc.reg_read(RegisterX86::RIP).unwrap_or(0);
 
         let rec = uc.get_data_mut();
         if rec.instret >= cfg.instr_cap {
+            rec.capped = true;
+        }
+        // a clean run stops exactly at our return sentinel. anything else - the
+        // wall-clock backstop firing on a genuine hang, or an emu error - left a
+        // truncated trace, so mark it capped instead of letting a partial run
+        // look like a complete one. without this a function engineered to stall
+        // past the deterministic caps but under the timer could forge a short,
+        // clean-looking print run to run.
+        if !rec.capped && (run_res.is_err() || rip != RET_ADDR) {
             rec.capped = true;
         }
         let mut effects = std::mem::take(&mut rec.effects);
         let dirs = std::mem::take(&mut rec.natural_dirs);
         let capped = rec.capped;
         let instret = rec.instret;
+        // fraction of the function's own code bytes we executed. size is > 0 for
+        // every indexed func (index filters size==0), but guard the divide and
+        // clamp: overlapping/greedy sizes could push covered past size.
+        let coverage = if func.size == 0 {
+            1.0
+        } else {
+            (rec.covered_bytes as f32 / func.size as f32).clamp(0.0, 1.0)
+        };
         if capped {
             effects.push(Effect::Capped);
         }
@@ -358,6 +387,7 @@ impl MicroExec {
                 effects,
                 instret,
                 capped,
+                coverage,
             },
             dirs,
         ))
@@ -508,6 +538,15 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
                 rec.capped = true;
                 uc.emu_stop().ok();
                 return;
+            }
+        }
+        // body coverage: count each in-range instruction once. separate borrow of
+        // the data so the cap-counter borrow above doesn't tangle with emu_stop.
+        {
+            let rec = uc.get_data_mut();
+            let first_visit = rec.visits.get(&addr).copied() == Some(1);
+            if first_visit && addr >= rec.func_lo && addr < rec.func_hi {
+                rec.covered_bytes = rec.covered_bytes.saturating_add(ilen);
             }
         }
 
@@ -752,6 +791,37 @@ mod tests {
             t.effects
         );
         assert!(ret_arg0, "should return arg0: {:?}", t.effects);
+    }
+
+    #[test]
+    fn coverage_low_when_body_unexecuted() {
+        // a single ret, but the func claims a large body. we only executed the
+        // ret, so coverage is tiny: the body sat behind code we never reached.
+        // this is the advisory signal for a print built from little behavior.
+        let code = [0xc3]; // ret
+        let func = Func {
+            name: None,
+            entry: 0x401000,
+            size: 0x200,
+            source: FuncSource::Symtab,
+        };
+        let t = MicroExec::new(Config::default()).run(&img(&code), &func, &HashMap::new());
+        assert!(t.coverage < 0.05, "coverage should be tiny: {}", t.coverage);
+    }
+
+    #[test]
+    fn coverage_full_when_whole_body_runs() {
+        // mov [rdi],rsi ; mov rax,rdi ; ret, with size == exactly these bytes.
+        // every instruction runs, so coverage is ~1.0.
+        let code = [0x48, 0x89, 0x37, 0x48, 0x89, 0xf8, 0xc3];
+        let func = Func {
+            name: None,
+            entry: 0x401000,
+            size: code.len() as u64,
+            source: FuncSource::Symtab,
+        };
+        let t = MicroExec::new(Config::default()).run(&img(&code), &func, &HashMap::new());
+        assert!(t.coverage > 0.9, "coverage should be ~full: {}", t.coverage);
     }
 
     #[test]

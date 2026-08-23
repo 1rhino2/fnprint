@@ -1,7 +1,9 @@
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -37,6 +39,56 @@ const MAX_REPLY: u64 = 128 << 20;
 // the hidden argv token the parent re-execs itself with to become the jailed
 // worker. anything the emulator touches runs behind it.
 const WORKER_TOKEN: &str = "__worker";
+
+// wall-clock backstop on the whole worker interaction. the worker has its own
+// deterministic per-function caps plus an RLIMIT_CPU, but neither bounds the
+// PARENT: a worker wedged not consuming CPU, or one that forked a subtree before
+// the jail latched, would otherwise block the parent's read/wait forever. past
+// this deadline the parent SIGKILLs the worker's whole process group.
+//
+// it MUST sit strictly above the worker's own CPU budget so RLIMIT_CPU (the
+// intended CPU bound) always fires first: the worker jail sets
+// RLIMIT_CPU = 120 * threads cpu-seconds, and emulation is serialized behind a
+// lock, so a legit large index can burn up to ~120 * threads WALL seconds. a
+// flat wall cap below that would false-abort a big index on a many-core box. so
+// scale with the same thread count and add margin; this only ever catches a true
+// hang (a blocked syscall consuming no CPU, which RLIMIT_CPU can never catch).
+fn worker_deadline() -> Duration {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get() as u64)
+        .unwrap_or(8);
+    Duration::from_secs(120u64.saturating_mul(threads).saturating_add(300))
+}
+
+// once the reply is in hand the worker only has to unwind and exit (milliseconds).
+// bound the reap anyway: a worker that closed stdout (giving us EOF) then made a
+// blocking syscall burns no CPU, so RLIMIT_CPU can't catch it and a plain wait()
+// would hang the parent forever. reachable only via a pre-jail compromise, but the
+// parent should never be hangable.
+const POST_REPLY_GRACE: Duration = Duration::from_secs(30);
+
+// reap the worker without ever hanging. poll for exit up to `grace`, then SIGKILL
+// the whole group and reap. kill-before-reap: the pid is still valid at the kill,
+// so there is no window where we could signal a reused pid/pgid.
+fn reap_bounded(
+    child: &mut std::process::Child,
+    pgid: Option<rustix::process::Pid>,
+    grace: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let until = std::time::Instant::now() + grace;
+    loop {
+        if let Some(st) = child.try_wait()? {
+            return Ok(st);
+        }
+        if std::time::Instant::now() >= until {
+            if let Some(pgid) = pgid {
+                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::Kill);
+            }
+            return child.wait();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 // what the jailed worker sends back over stdout. the parent treats every field
 // as untrusted (a popped worker can put anything here): entry addresses and
@@ -197,11 +249,12 @@ fn render_traces(traces: &[EffectTrace]) -> Vec<String> {
     let mut out = Vec::new();
     for (i, t) in traces.iter().enumerate() {
         out.push(format!(
-            "-- path {} ({} effects, instret {}, capped {}) --",
+            "-- path {} ({} effects, instret {}, capped {}, coverage {:.2}) --",
             i,
             t.effects.len(),
             t.instret,
-            t.capped
+            t.capped,
+            t.coverage
         ));
         for e in &t.effects {
             out.push(format!("   {e:?}"));
@@ -239,8 +292,16 @@ fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply>
         // sequences through unescaped. we drain it on a thread, keep a bounded
         // tail, and esc() it before it ever reaches the terminal.
         .stderr(Stdio::piped());
+    // put the worker in its own process group (pgid == its pid) so we can signal
+    // the whole subtree at once. setpgid runs in the child after fork, before
+    // exec, so long before the worker installs its seccomp jail.
+    cmd.process_group(0);
     let mut child = cmd.spawn().context("spawning jailed worker")?;
+    // pgid == pid because of process_group(0) above
+    let wpgid = rustix::process::Pid::from_raw(child.id() as i32);
 
+    // stdin writer: feed the payload on its own thread so a large ELF can't
+    // deadlock against the reply on a full pipe.
     let mut stdin = child.stdin.take().context("worker stdin")?;
     let payload = input.to_vec();
     let writer = std::thread::spawn(move || {
@@ -250,8 +311,8 @@ fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply>
     });
 
     // drain stderr on its own thread so a chatty worker can't wedge on a full
-    // stderr pipe while we're blocked reading stdout. keep only a bounded tail;
-    // discard the rest so the worker never blocks writing.
+    // stderr pipe. keep only a bounded tail; discard the rest so the worker never
+    // blocks writing.
     let mut errpipe = child.stderr.take().context("worker stderr")?;
     let errdrain = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -260,17 +321,57 @@ fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply>
         buf
     });
 
-    let mut out = Vec::new();
-    {
-        let mut stdout = child.stdout.take().context("worker stdout")?;
-        stdout
-            .by_ref()
-            .take(MAX_REPLY + 1)
-            .read_to_end(&mut out)
-            .context("reading worker reply")?;
-    }
-    let status = child.wait().context("waiting on worker")?;
+    // read the reply on its own thread and hand it back over a channel, so the
+    // main thread can put a wall-clock deadline on the whole exchange with
+    // recv_timeout. doing the kill from here (rather than a separate thread
+    // watching an already-reaped child) means the SIGKILL on timeout always
+    // happens BEFORE we wait()/reap, while the pid is still valid: there is no
+    // window where we could signal a reused pid/pgid.
+    let mut stdout = child.stdout.take().context("worker stdout")?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel::<std::io::Result<Vec<u8>>>();
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let r = stdout.by_ref().take(MAX_REPLY + 1).read_to_end(&mut out);
+        let _ = reply_tx.send(r.map(|_| out));
+    });
+
+    let deadline = worker_deadline();
+    let out = match reply_rx.recv_timeout(deadline) {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            // read failed (worker died mid-write, etc). reap and report.
+            let _ = child.wait();
+            let _ = writer.join();
+            let _ = reader.join();
+            return Err(anyhow::Error::new(e).context("reading worker reply"));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // deadline hit. SIGKILL the whole group BEFORE reaping so the pid is
+            // still valid (no reuse window) and any forked subtree dies too. we do
+            // not join reader/writer/errdrain here: if a descendant escaped the
+            // group and holds a pipe fd (only reachable via a pre-jail compromise)
+            // a join could hang, and the parent is bailing out regardless.
+            if let Some(pgid) = wpgid {
+                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::Kill);
+            }
+            let _ = child.wait();
+            bail!(
+                "jailed worker exceeded the {}s time budget and was killed",
+                deadline.as_secs()
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            // reader thread vanished without sending (panicked). reap and report.
+            let _ = child.wait();
+            bail!("jailed worker reply reader failed");
+        }
+    };
+
+    // reply in hand; reap the worker, bounded so a post-reply blocking hang can't
+    // wedge the parent (see reap_bounded).
+    let status = reap_bounded(&mut child, wpgid, POST_REPLY_GRACE).context("waiting on worker")?;
     let _ = writer.join();
+    let _ = reader.join();
     let errtail = errdrain.join().unwrap_or_default();
 
     if !status.success() {
@@ -298,8 +399,18 @@ fn run_index(bytes: &[u8], no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
         return index_bytes(bytes, Config::default());
     }
     match run_worker("index", None, bytes)? {
-        WorkerReply::IndexOk(funcs) => {
+        WorkerReply::IndexOk(mut funcs) => {
             validate_reply_fps(&funcs)?;
+            // a popped worker controls the reply: coverage is advisory and never
+            // gates, but sanitize it anyway (NaN/negative/huge -> assume covered)
+            // so a crafted value can't render a garbage % in the triage table.
+            for f in &mut funcs {
+                f.coverage = if f.coverage.is_finite() {
+                    f.coverage.clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+            }
             Ok(funcs)
         }
         // the worker's error text is built from the parser, which handles attacker
@@ -432,6 +543,9 @@ fn load_index(path: &str, no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
                 entry: r.entry,
                 source: FuncSource::Symtab,
                 fp: r.fp,
+                // a .db target was indexed earlier and never stored coverage, so
+                // we can't re-derive it. assume covered rather than gate a corpus.
+                coverage: 1.0,
             })
             .collect())
     } else {
@@ -583,18 +697,31 @@ fn cmd_triage(
     }
     // the review queue: strongest vulnerable lead first
     println!("\nreview queue (vuln-leaning, strongest first):");
-    println!("   addr         vuln%  patched%  margin  matches");
+    println!("   addr         vuln%  patched%  margin  cov   matches");
     for h in vulns {
+        // advisory: flag a lead built from little observed behavior so it gets a
+        // second look. not a filter, the lead still shows.
+        let cov_flag = if h.coverage <= fnprint_core::LOW_COVERAGE_ADVISORY {
+            "!"
+        } else {
+            " "
+        };
         println!(
-            "   {:#010x}  {:>5.1}   {:>6.1}   {:>+5.1}  {} vs {}",
+            "   {:#010x}  {:>5.1}   {:>6.1}   {:>+5.1}  {:>3.0}%{} {} vs {}",
             h.entry,
             h.vuln_sim * 100.0,
             h.patched_sim * 100.0,
             h.margin() * 100.0,
+            h.coverage * 100.0,
+            cov_flag,
             esc(&h.vuln_name),
             esc(&h.patched_name),
         );
     }
+    println!("\ncov = fraction of the target function body microexecution observed.");
+    println!(
+        "a low cov (flagged !) means the verdict rests on little behavior; give it a second look."
+    );
     Ok(())
 }
 

@@ -68,6 +68,22 @@ impl Db {
         // keep any query spill in memory. the jail has no temp-file access anyway,
         // so this turns a would-be EPERM into a normal in-memory sort.
         conn.pragma_update(None, "temp_store", "MEMORY")?;
+        // harden against a hostile image before we parse its schema. a crafted
+        // .db can name `funcs` a VIEW (or trigger) whose body reaches vtab
+        // modules (fts/rtree) and SQL functions, turning our plain SELECT into
+        // arbitrary sqlite surface. DEFENSIVE blocks writes to shadow/schema via
+        // the parsed schema; TRUSTED_SCHEMA=false makes schema-defined SQL run as
+        // untrusted (no vtab/loadable funcs from the schema); ENABLE_VIEW=false
+        // rejects views outright, so `funcs` must be a real table.
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA,
+            false,
+        )?;
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW,
+            false,
+        )?;
         let data = owned_from_bytes(bytes)?;
         // read_only = true -> SQLITE_DESERIALIZE_READONLY: sqlite refuses writes
         // and never grows/journals the image.
@@ -285,6 +301,10 @@ impl Corpus for MemCorpus {
                 }
             }
         }
+        // sort so the candidate pool has a stable order: HashSet iteration is
+        // nondeterministic and downstream scoring breaks ties by pool position.
+        let mut idxs: Vec<usize> = idxs.into_iter().collect();
+        idxs.sort_unstable();
         Ok(idxs.into_iter().map(|i| self.recs[i].clone()).collect())
     }
 }

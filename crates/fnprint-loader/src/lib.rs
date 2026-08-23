@@ -75,6 +75,12 @@ const MAX_SEG_MEM: u64 = 1 << 30; // 1 GiB
 /// total mapped memory across all segments, same idea, bounds a fan-out of many
 /// medium segments that each pass the per-segment check.
 const MAX_TOTAL_MEM: u64 = 1 << 31; // 2 GiB
+/// cap on the number of PT_LOAD segments. total-memory is not enough on its own:
+/// thousands of tiny segments stay under MAX_TOTAL_MEM but each becomes a qemu
+/// memory region at emulate time, and softmmu cost is super-linear in region
+/// count, so a few-hundred-KB crafted ELF can drive minutes of CPU. a real
+/// binary has a handful of PT_LOADs; 256 is far above anything legit.
+const MAX_LOAD_SEGS: usize = 256;
 
 pub fn load(bytes: &[u8]) -> Result<Loaded> {
     let elf = Elf::parse(bytes).context("not a valid elf")?;
@@ -137,6 +143,9 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
             ph.is_executable(),
             ph.is_write(),
         ));
+        if plans.len() > MAX_LOAD_SEGS {
+            bail!("over {} PT_LOAD segments, refusing", MAX_LOAD_SEGS);
+        }
     }
     if plans.is_empty() {
         bail!("no PT_LOAD segments");
@@ -283,6 +292,11 @@ fn eh_frame_funcs(elf: &Elf, raw: &[u8]) -> Option<Vec<Func>> {
             Ok(None) => break,
             Err(_) => break,
         }
+        // same cap discover() applies: a crafted .eh_frame full of tiny FDEs
+        // must not force an unbounded func list here where symtab's cap misses.
+        if out.len() >= MAX_FUNCS {
+            break;
+        }
     }
     if out.is_empty() {
         None
@@ -398,6 +412,54 @@ mod tests {
             put64(&mut e, ph + 48, 0x1000);
         }
         e
+    }
+
+    // n PT_LOADs each tiny (filesz 16, memsz 0x1000) so total memory stays far
+    // under MAX_TOTAL_MEM. isolates the per-count cap from the byte cap.
+    fn craft_elf_nsegs_small(n: u16) -> Vec<u8> {
+        let phoff = 64usize;
+        let file_len = phoff + (n as usize) * 56;
+        let mut e = vec![0u8; file_len];
+        e[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        e[4] = 2;
+        e[5] = 1;
+        e[6] = 1;
+        let put16 =
+            |e: &mut [u8], off: usize, v: u16| e[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |e: &mut [u8], off: usize, v: u32| e[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |e: &mut [u8], off: usize, v: u64| e[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        put16(&mut e, 16, 2);
+        put16(&mut e, 18, 62);
+        put32(&mut e, 20, 1);
+        put64(&mut e, 32, phoff as u64);
+        put16(&mut e, 52, 64);
+        put16(&mut e, 54, 56);
+        put16(&mut e, 56, n);
+        for i in 0..n as usize {
+            let ph = phoff + i * 56;
+            put32(&mut e, ph, 1); // PT_LOAD
+            put32(&mut e, ph + 4, 4); // R
+            put64(&mut e, ph + 8, 0); // p_offset
+            put64(&mut e, ph + 16, 0x1000 + i as u64 * 0x1000); // distinct vaddr
+            put64(&mut e, ph + 32, 16); // small p_filesz
+            put64(&mut e, ph + 40, 0x1000); // p_memsz
+            put64(&mut e, ph + 48, 0x1000);
+        }
+        e
+    }
+
+    #[test]
+    fn too_many_small_segments_refused_by_count() {
+        // ~300 tiny segments: total memory is ~1.2 MB (well under MAX_TOTAL_MEM),
+        // so only the per-count cap can catch this region-flood. must be refused
+        // rather than turned into hundreds of qemu memory regions at emulate time.
+        let elf = craft_elf_nsegs_small(300);
+        assert!(
+            load(&elf).is_err(),
+            "expected the segment-count cap to refuse the region flood"
+        );
     }
 
     #[test]

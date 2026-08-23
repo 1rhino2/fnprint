@@ -186,6 +186,7 @@ mod tests {
             effects,
             instret: 100,
             capped: false,
+            coverage: 1.0,
         }
     }
 

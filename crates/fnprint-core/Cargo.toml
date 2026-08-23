@@ -10,11 +10,11 @@ repository.workspace = true
 anyhow = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
-fnprint-loader = { path = "../fnprint-loader", version = "0.3.1" }
-fnprint-emu = { path = "../fnprint-emu", version = "0.3.1" }
-fnprint-sig = { path = "../fnprint-sig", version = "0.3.1" }
-fnprint-db = { path = "../fnprint-db", version = "0.3.1" }
-fnprint-trace = { path = "../fnprint-trace", version = "0.3.1" }
+fnprint-loader = { path = "../fnprint-loader", version = "0.3.2" }
+fnprint-emu = { path = "../fnprint-emu", version = "0.3.2" }
+fnprint-sig = { path = "../fnprint-sig", version = "0.3.2" }
+fnprint-db = { path = "../fnprint-db", version = "0.3.2" }
+fnprint-trace = { path = "../fnprint-trace", version = "0.3.2" }
 
 [lints]
 workspace = true

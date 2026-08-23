@@ -14,6 +14,15 @@ use rayon::prelude::*;
 pub const MIN_COMPLEXITY: u32 = 4;
 /// two prints this close are "the same function"
 pub const SAME_THRESH: f64 = 0.88;
+/// advisory only: a coverage at or below this is worth an analyst's second look
+/// (the print was built from a small slice of the body). it does NOT gate a
+/// verdict. low coverage cannot gate, because the functions that matter most for
+/// n-day work (large input-driven state machines like zlib inflate/deflate)
+/// legitimately execute almost none of their body on microexecution's junk
+/// input, so a hard gate would refuse verdicts on exactly the crown-jewel CVE
+/// functions. coverage is surfaced next to results so a human can discount a
+/// suspicious low-coverage match; it is not a forgery gate. see SECURITY.md.
+pub const LOW_COVERAGE_ADVISORY: f32 = 0.15;
 /// fixed seeds used per function. deterministic, so prints are reproducible.
 const SEEDS: [u64; 4] = [0, 0x9e3779b9, 0x1234_5678, 0xdead_beef];
 
@@ -33,6 +42,19 @@ pub struct IndexedFunc {
     pub entry: u64,
     pub source: FuncSource,
     pub fp: Fingerprint,
+    /// best coverage across this function's seed runs, in [0,1]. advisory signal
+    /// of how much of the body microexecution actually observed; surfaced next to
+    /// results so a low-coverage match can be discounted by a human. not a gate.
+    #[serde(default = "default_coverage")]
+    pub coverage: f32,
+}
+
+// default for a missing coverage field. the worker reply is postcard (positional,
+// not self-describing), and the worker is always a self re-exec of the same
+// binary, so a version-skewed reply can't actually occur over that pipe; this
+// default only matters if IndexedFunc is ever read from a self-describing format.
+fn default_coverage() -> f32 {
+    1.0
 }
 
 // re-exported so the cli's privsep worker can render dump output without
@@ -86,11 +108,16 @@ pub fn index_bytes(bytes: &[u8], cfg: Config) -> Result<Vec<IndexedFunc>> {
                 // that only shows up on some inputs still makes it into the print.
                 ex.run_explore(image, f, &symbols, &SEEDS)
             };
+            // best coverage any seed reached: the fairest read of how much of the
+            // body is actually observable, since input-dependent branches differ
+            // by seed. from_traces already unions the effects.
+            let coverage = traces.iter().map(|t| t.coverage).fold(0.0f32, f32::max);
             IndexedFunc {
                 name: f.name.clone(),
                 entry: f.entry,
                 source: f.source,
                 fp: Fingerprint::from_traces(&traces),
+                coverage,
             }
         })
         .collect();
@@ -211,7 +238,19 @@ fn best_in_corpus<C: Corpus>(
             None => continue,
         };
         let sim = fp.similarity(&c.fp);
-        if best.as_ref().map(|(s, _, _)| sim > *s).unwrap_or(true) {
+        // total tie-break: on equal similarity prefer the lexicographically
+        // smaller (name, binary). without this the winner depended on pool
+        // order, which the candidate set does not guarantee, so the same query
+        // could name a different twin run to run.
+        let better = match best.as_ref() {
+            None => true,
+            Some((s, bn, bb)) => {
+                sim > *s
+                    || (sim == *s
+                        && (cname.as_str(), c.binary.as_str()) < (bn.as_str(), bb.as_str()))
+            }
+        };
+        if better {
             best = Some((sim, cname.clone(), c.binary.clone()));
         }
     }
@@ -265,6 +304,11 @@ pub struct TriageHit {
     pub vuln_name: String,
     pub patched_sim: f64,
     pub patched_name: String,
+    /// fraction of the target function body executed, in [0,1]. advisory: a low
+    /// value means the print was built from a small slice of the function, so the
+    /// verdict rests on little observed behavior. shown to the analyst, does not
+    /// change the verdict (see LOW_COVERAGE_ADVISORY).
+    pub coverage: f32,
 }
 
 impl TriageHit {
@@ -330,6 +374,7 @@ pub fn triage<C: Corpus>(
             vuln_name,
             patched_sim,
             patched_name,
+            coverage: f.coverage,
         });
     }
     out.sort_by(|a, b| {
@@ -524,6 +569,7 @@ mod tests {
                 complexity,
                 capped: false,
             },
+            coverage: 1.0,
         }
     }
 
@@ -573,6 +619,30 @@ mod tests {
 
         let looks_patched = triage(&[ifunc("x", 999, 10)], &vuln, &patched, 0.5, 0.1).unwrap();
         assert_eq!(looks_patched[0].verdict, Verdict::Patched);
+    }
+
+    #[test]
+    fn low_coverage_is_advisory_not_a_gate() {
+        // a target that clearly matches the vuln side but has 0 coverage must
+        // still come back Vulnerable: coverage is surfaced, never gates a verdict
+        // (else the crown-jewel functions, which run almost none of their body,
+        // would never get a call).
+        let vuln = Db::open_memory().unwrap();
+        vuln.insert("v1", Some("f"), 0x1000, "symtab", &ifunc("f", 3, 10).fp)
+            .unwrap();
+        let patched = Db::open_memory().unwrap();
+        patched
+            .insert("v2", Some("f"), 0x1000, "symtab", &ifunc("f", 999, 10).fp)
+            .unwrap();
+
+        let mut t = ifunc("x", 3, 10);
+        t.coverage = 0.0;
+        let hits = triage(&[t], &vuln, &patched, 0.5, 0.1).unwrap();
+        assert_eq!(hits[0].verdict, Verdict::Vulnerable);
+        assert_eq!(
+            hits[0].coverage, 0.0,
+            "coverage carried through for display"
+        );
     }
 
     #[test]

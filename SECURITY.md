@@ -31,6 +31,11 @@ can't afford to have the emulator crash on.
 
 - Sizes taken from headers (`p_memsz`, section sizes) are capped and refused past
   the limit, so a crafted header can't force a huge allocation.
+- Counts are capped too, not just sizes: the number of PT_LOAD segments, the
+  number of discovered functions (symbol table and `.eh_frame` alike), and per
+  symbol name length. A few hundred KB of ELF with thousands of tiny segments or
+  FDEs would otherwise stay under the byte caps yet turn into a region flood the
+  emulator pays super-linear cost on; the count caps refuse it before that.
 - Arithmetic on file-derived offsets is overflow-safe (`checked_`/`saturating_`),
   so a hostile `vaddr`/`offset`/`size` can't wrap into a panic or a bad index.
 - The loader has adversarial tests for truncated files, past-EOF offsets,
@@ -99,7 +104,12 @@ path. The worker jails itself, then parses the image entirely in memory with
 `sqlite3_deserialize` (read-only) and returns the decoded fingerprint rows. No
 file is opened for the parse: the whole SQLite surface (b-tree pages, cell and
 record decoding, overflow pages) only ever touches that in-memory buffer, under
-the same seccomp filters that jail the emulator. The parent then rebuilds the LSH
+the same seccomp filters that jail the emulator. Before the image is parsed the
+connection is hardened: `SQLITE_DBCONFIG_DEFENSIVE`, `TRUSTED_SCHEMA=off`, and
+`ENABLE_VIEW=off`, so a crafted `.db` cannot name `funcs` a VIEW whose body reaches
+virtual-table modules or schema-defined SQL functions; the reader only sees a
+plain table. (Legit corpora store `funcs` as a real table, so this changes
+nothing for them.) The parent then rebuilds the LSH
 band index from the returned rows in safe Rust and runs the comparison; it never
 runs SQLite on the untrusted image. The corpus path is also defended against SQL
 injection (every value is a bound parameter) and against malformed rows (a bad
@@ -152,8 +162,38 @@ These are understood and accepted, not oversights:
 - Resource limits are a backstop, not a fence. `RLIMIT_NPROC` is deliberately
   not clamped (it would break qemu's helper threads), so a popped worker could
   fork more jailed copies; each is still fully jailed, and OOM handling is the
-  host's job. `RLIMIT_CPU` bounds CPU but there is no wall-clock bound on a
-  syscall that just blocks.
+  host's job. As a bound on both that and a wedged worker, the trusted parent
+  puts the worker in its own process group and enforces a wall-clock deadline on
+  the whole exchange: past it, the parent `SIGKILL`s the entire worker process
+  group (the worker plus anything it forked), so a hang or a fork subtree can't
+  block the parent forever. `RLIMIT_CPU` still bounds CPU inside the worker; the
+  parent deadline is the wall-clock complement it used to lack.
+- Fingerprint forgery. A fingerprint is behavior observed on one microexecution
+  path, and that path is attacker-influenceable. A crafted function can gate its
+  real behavior behind a branch that microexecution never takes, for instance a
+  guard that compares an argument against a value the emulator fabricates (the
+  arg registers and input buffers are seeded from fixed public constants), so the
+  natural path only ever sees a benign decoy and the print reflects the decoy, not
+  the real code. This can make a function print as something it is not (evade an
+  n-day match, or impersonate a known-good function). Two mitigations were
+  evaluated. Forced branch exploration (also run the not-taken side and union its
+  effects into the print) does defeat the decoy, but it was measured to badly hurt
+  the honest cross-build matching this tool exists for: forcing impossible paths
+  injects build-specific noise, dropping cross-optimization rank-1 accuracy on the
+  zlib benchmark by 25-44 points (e.g. gcc O0->O3 from 91% to 47%), so it is not
+  shipped. A hard coverage gate (refuse a verdict when too little of the body ran)
+  was also rejected: the functions that matter most for n-day work are large,
+  input-driven state machines (zlib `inflate`/`deflate`) that legitimately execute
+  almost none of their body on junk input (coverage 0.00-0.01), so a gate would
+  refuse verdicts on exactly the crown-jewel CVE functions. What ships instead is
+  an advisory coverage signal: every print records the fraction of the function
+  body microexecution observed, and `triage` shows it per lead and flags the low
+  ones, so a reviewer can discount a verdict built from little behavior. It is not
+  a gate and does not change matching. The residual: coverage flags the
+  large-hidden-payload shape, but a small payload hidden behind a decoy that keeps
+  coverage high can still forge, and the advisory relies on a human reading it.
+  This is fundamental to a single-pass behavioral matcher; treat a fingerprint as
+  evidence about the paths that ran, not a certificate about the whole function.
 - The no-JIT guarantee needs a unicorn built with `CONFIG_TCG_INTERPRETER`,
   which upstream unicorn does not ship. So the emulator comes from a small fork,
   `unicorn-engine-tci` + `unicorn-engine-sys-tci` (GPL-2.0), pinned to `=2.1.5`

@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
-fnprint-trace = { path = "../fnprint-trace", version = "0.3.1" }
+fnprint-trace = { path = "../fnprint-trace", version = "0.3.2" }
 
 [lints]
 workspace = true
