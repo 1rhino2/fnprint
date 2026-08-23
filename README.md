@@ -17,6 +17,10 @@ x86-64 ELF only for now. see [limits](#what-it-is-bad-at) before you trust it.
 
 ## show me
 
+<p align="center">
+  <img src="assets/demo.gif" alt="fnprint naming functions in a stripped, differently-compiled binary" width="820">
+</p>
+
 point it at a stripped binary and a corpus of things you already have names for:
 
 ```
