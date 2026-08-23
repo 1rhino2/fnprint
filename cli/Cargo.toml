@@ -1,12 +1,13 @@
 [package]
 name = "fnprint"
-version = "0.3.2"
+version = "0.3.3"
 edition.workspace = true
 license.workspace = true
-description = "Match functions in binaries by what they do, not what their bytes look like"
+description = "Behavioral function fingerprinting: name functions in stripped binaries and patch-diff builds by what they do, not their bytes"
 repository.workspace = true
-keywords = ["reverse-engineering", "binary-analysis", "fingerprint", "disassembly", "security"]
-categories = ["command-line-utilities", "development-tools"]
+documentation = "https://docs.rs/fnprint"
+keywords = ["reverse-engineering", "binary-analysis", "fingerprint", "malware", "security"]
+categories = ["command-line-utilities", "development-tools", "development-tools::debugging"]
 readme = "../README.md"
 
 [[bin]]
