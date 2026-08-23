@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fnprint - name functions in stripped binaries by what they do</title>
+<meta name="description" content="fnprint is a Rust reverse-engineering tool that fingerprints functions by behavior, not bytes. Name functions in stripped x86-64 ELF binaries and rank n-day patch-diff candidates across compilers and optimization levels.">
+<meta name="keywords" content="reverse engineering, binary analysis, function fingerprinting, stripped binary, n-day, patch diff, bindiff, diaphora, microexecution, minhash, lsh, malware analysis, rust, x86-64, elf">
+<meta name="author" content="1rhino2">
+<link rel="canonical" href="https://1rhino2.github.io/fnprint/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="fnprint - behavioral function fingerprinting">
+<meta property="og:description" content="Name functions in stripped binaries and rank patch-diff candidates by what they do, not their bytes. Rust, MIT, x86-64 ELF.">
+<meta property="og:url" content="https://1rhino2.github.io/fnprint/">
+<meta property="og:image" content="https://1rhino2.github.io/fnprint/social-preview.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://1rhino2.github.io/fnprint/social-preview.png">
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161a21; --line:#232833;
+    --title:#e6e9ef; --slate:#7c8a9c; --muted:#9aa3af; --gray:#5c636f;
+    --green:#98c379; --cyan:#56b6c2; --accent:#6e7b8b;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--title);
+    font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  code,kbd,pre,.mono{font-family:"DejaVu Sans Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  a{color:var(--cyan); text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:900px; margin:0 auto; padding:0 20px}
+  .bar{height:4px; background:var(--accent)}
+  header{padding:64px 0 40px}
+  h1{font-family:"DejaVu Sans Mono",ui-monospace,monospace; font-size:64px; margin:0; letter-spacing:-1px}
+  .tag{font-size:22px; color:var(--slate); margin:14px 0 4px; font-weight:600}
+  .sub{color:var(--muted); font-size:16px; margin:0 0 28px; max-width:620px}
+  .cta{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+  .install{
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    padding:12px 16px; font-size:15px; color:var(--title);
+  }
+  .install .p{color:var(--green)}
+  .links{display:flex; gap:18px; flex-wrap:wrap; margin-top:18px; font-size:15px}
+  .links a{color:var(--slate)}
+  section{padding:34px 0; border-top:1px solid var(--line)}
+  h2{font-family:"DejaVu Sans Mono",ui-monospace,monospace; font-size:15px; color:var(--slate);
+     text-transform:lowercase; letter-spacing:1px; margin:0 0 18px; font-weight:700}
+  h2::before{content:"# "; color:var(--gray)}
+  p{margin:0 0 14px; color:#cdd3dc}
+  img{max-width:100%; height:auto; display:block; border:1px solid var(--line); border-radius:8px}
+  .grid{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:18px}
+  .card h3{margin:0 0 8px; font-size:16px; color:var(--title)}
+  .card p{margin:0; font-size:14.5px; color:var(--muted)}
+  pre{background:var(--panel); border:1px solid var(--line); border-radius:8px;
+      padding:16px 18px; overflow-x:auto; font-size:14px; line-height:1.7; color:#cdd3dc; margin:0 0 16px}
+  .term .p{color:var(--green)} .term .cy{color:var(--cyan)} .term .gn{color:var(--green)}
+  .term .gr{color:var(--gray)}
+  .note{color:var(--muted); font-size:14.5px}
+  ul.plain{margin:0; padding-left:20px; color:#cdd3dc}
+  ul.plain li{margin:6px 0}
+  footer{padding:40px 0 64px; border-top:1px solid var(--line); color:var(--gray); font-size:14px}
+  footer .mono{color:var(--slate)}
+  @media (max-width:640px){ h1{font-size:44px} .grid{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+<div class="bar"></div>
+<div class="wrap">
+
+<header>
+  <h1>fnprint</h1>
+  <div class="tag">behavioral function fingerprinting</div>
+  <p class="sub">Name functions in stripped x86-64 ELF binaries by what they do, not their bytes. Built for n-day triage when the builds don't line up.</p>
+  <div class="cta">
+    <div class="install mono"><span class="p">$</span> cargo install fnprint</div>
+  </div>
+  <div class="links">
+    <a href="https://github.com/1rhino2/fnprint">github</a>
+    <a href="https://crates.io/crates/fnprint">crates.io</a>
+    <a href="https://docs.rs/fnprint-core">docs.rs</a>
+    <a href="case-study-cve-2018-25032.md">cve case study</a>
+  </div>
+</header>
+
+<section>
+  <h2>show me</h2>
+  <img src="demo.gif" alt="fnprint naming functions in a stripped, differently-compiled binary">
+  <p class="note" style="margin-top:14px">Point it at a stripped binary, get names back from a corpus you built. The demo names functions in a clang -O3 build using a gcc -O0 corpus, so the byte-level code is completely different.</p>
+</section>
+
+<section>
+  <h2>what it does</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>name stripped functions</h3>
+      <p>Build a corpus from binaries you have symbols for, then query an unknown stripped build. fnprint returns the closest-behaving named function for each unknown one.</p>
+    </div>
+    <div class="card">
+      <h3>rank n-day patch diffs</h3>
+      <p>Give it a vuln build and a patched build. It ranks which functions in an unknown target lean vulnerable, so you open the right ones first.</p>
+    </div>
+    <div class="card">
+      <h3>survives recompiles</h3>
+      <p>It compares behavior, so a compiler swap or an optimization-level gap that wrecks a CFG diff (bindiff, diaphora) matters much less here.</p>
+    </div>
+    <div class="card">
+      <h3>runs untrusted code safely</h3>
+      <p>Microexecution happens in a seccomp + rlimit jailed worker on a no-JIT emulator, so nothing the target does can escape or execute.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>how it works</h2>
+  <p>fnprint microexecutes each function on a no-JIT unicorn fork, records the effects it produces (memory reads and writes, calls, syscalls, return behavior), and turns that effect trace into a MinHash/LSH fingerprint. Matching is behavioral similarity between fingerprints, not byte or structure matching. The emulated code never runs with executable memory and never leaves a locked-down worker process.</p>
+</section>
+
+<section>
+  <h2>a real n-day: CVE-2018-25032</h2>
+  <p>The zlib memory-corruption bug fixed between 1.2.11 and 1.2.12. Corpora built at -O0, the target at -O2, so a CFG diff burns its time on optimization noise. Actual triage output:</p>
+  <pre class="term">52 functions triaged: 5 look vulnerable, 0 patched, 47 inconclusive
+
+review queue (vuln-leaning, strongest first):
+   <span class="gr">addr         vuln%  patched%  margin  matches</span>
+   0x00002d40  <span class="gn">100.0</span>     69.5   +30.5  crc32_big vs adler32_z
+   0x0000d7e0  <span class="gn">100.0</span>     40.6   +59.4  <span class="cy">_tr_tally</span> vs _tr_tally
+   0x00004270   79.7     66.4   +13.3  <span class="cy">deflate_stored</span> vs deflate_stored
+   0x0000ce50   78.9     66.4   +12.5  <span class="cy">_tr_stored_block</span> vs _tr_stored_block
+   0x0000c860   68.8     30.5   +38.3  <span class="cy">compress_block</span> vs compress_block</pre>
+  <p class="note">Four of the five it surfaced (_tr_tally, deflate_stored, _tr_stored_block, compress_block) are exactly the CVE-changed functions, found across the -O0 to -O2 gap. The 47 unchanged functions stayed inconclusive instead of cluttering the queue. <a href="case-study-cve-2018-25032.md">Full writeup with reproduce steps.</a></p>
+</section>
+
+<section>
+  <h2>what it is bad at</h2>
+  <ul class="plain">
+    <li>Pure-compute functions with thin behavior (checksums, hashes) collide. crc32_big matching adler32_z above is the documented weak spot.</li>
+    <li>x86-64 ELF only right now.</li>
+    <li>It ranks and names, it does not replace the RE. The value is deciding what to open first when builds don't match, which is most real 1-day work.</li>
+  </ul>
+</section>
+
+<footer>
+  <div class="wrap" style="padding:0">
+    <span class="mono">Rust  .  MIT  .  x86-64 ELF</span><br><br>
+    <a href="https://github.com/1rhino2/fnprint">github.com/1rhino2/fnprint</a>
+  </div>
+</footer>
+
+</div>
+</body>
+</html>
