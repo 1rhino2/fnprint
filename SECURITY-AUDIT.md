@@ -1,4 +1,9 @@
-# fnprint 0.3.0 security audit (20-lane)
+# fnprint security audit
+
+Append-per-release audit record, oldest first. The 0.3.0 audit is below; the
+0.3.2 exploitation-focused audit is at the end of the file.
+
+# 0.3.0 audit (20-lane, 2026-08-22)
 
 Full parallel audit of fnprint 0.3.0 (the shipped crates.io / main state) plus the
 unicorn-engine-tci fork. 20 independent lanes, source-read only (no builds).
@@ -133,3 +138,84 @@ path; x32 tripwire (full coverage table verified vs live kernel); determinism (V
 order, FNV, fixed seeds, EMU_LOCK); info-leak posture (basename only, hermetic emu);
 supply chain (cargo audit + cargo deny clean, exact pins + lock checksums);
 panic surface (no parent-process panic reachable from crafted input).
+
+# 0.3.2 audit (exploitation-focused deep audit, 2026-08-23)
+
+Where the 0.3.0 audit was breadth-first ("find anything"), this one was told to
+keep hunting until it found a valid, patchable vuln, then a full pre-publish
+review. It found the headline forgery plus a cluster of crafted-input DoS bugs.
+Fixed and shipped in 0.3.2; both mandatory reviews cleared the diff; accuracy is
+byte-identical to bench/NUMBERS.md (the matching path is untouched).
+
+## The headline: fingerprint forgery (documented hard residual, NOT fixed)
+
+A fingerprint is behavior observed on one microexecution path, and that path is
+attacker-influenceable. A crafted function can gate its real behavior behind a
+branch microexecution never takes (e.g. a guard comparing an argument against a
+value the emulator fabricates, since the arg registers and input buffers are
+seeded from fixed public constants), so the print reflects only a benign decoy.
+Confirmed by direct repro: a `victim` whose real memcpy sat behind such a guard
+printed as pure-decoy.
+
+Two mitigations were built, measured, and REJECTED:
+- Forced branch exploration (also run the not-taken side, union its effects).
+  Defeats the decoy but dropped cross-optimization rank-1 accuracy 25-44 points
+  (gcc O0->O3 91% -> 47%): forcing impossible paths injects build-specific noise,
+  and "targeted" is impossible because under microexecution every input is
+  fabricated, so there is no clean subset to flip. Not shipped.
+- Hard coverage gate (refuse a verdict when too little of the body ran). Rejected
+  because the functions that matter most for n-day work are large input-driven
+  state machines (zlib inflate/deflate) that legitimately execute ~none of their
+  body on junk input (coverage 0.00-0.01), so a gate would refuse verdicts on
+  exactly the crown-jewel CVE functions. Low coverage cannot discriminate forgery
+  from legitimate complexity.
+
+Shipped instead: an ADVISORY coverage signal. Every print records the fraction of
+the function body microexecution observed (emu -> EffectTrace.coverage ->
+IndexedFunc.coverage); triage shows it per lead and flags low ones with `!`. It is
+observational only, never gates a verdict, never changes a fingerprint (matching
+accuracy is provably unchanged). Residual: it flags the large-hidden-payload shape
+but a small payload behind a decoy that keeps coverage high can still forge, and
+the advisory relies on a human reading it. This is fundamental to a single-pass
+behavioral matcher. See SECURITY.md.
+
+## DoS / correctness findings (all fixed, all accuracy-neutral)
+
+- PT_LOAD segment-count flood (confirmed). The loader capped segment size but not
+  count; a few-hundred-KB ELF with thousands of tiny segments stayed under the
+  byte caps yet became a qemu memory-region flood the softmmu pays super-linear
+  cost on. Fixed: MAX_LOAD_SEGS = 256, plus the same count cap on .eh_frame FDEs.
+- Crafted-db view -> vtab reachability (view path confirmed; memory-corruption via
+  the stale bundled SQLite 3.45.0 plausible, not reproduced). A corpus .db could
+  name `funcs` a VIEW whose body reaches fts/rtree vtab modules and schema SQL
+  functions. Fixed: open_image sets DEFENSIVE, TRUSTED_SCHEMA=off, ENABLE_VIEW=off
+  before deserialize, so the reader only sees a plain table. (The SQLite version
+  bump itself is deferred; the reachable path is closed.)
+- Parent-hang + fork-bomb (confirmed). The parent blocked on read/wait forever if
+  the worker wedged, and RLIMIT_NPROC is unclamped. Fixed: the parent runs the
+  worker in its own process group with a wall-clock deadline scaled above the
+  worker's RLIMIT_CPU (so the CPU bound fires first for legit work), and SIGKILLs
+  the whole group past it. Kill-before-reap (reader-thread recv_timeout +
+  reap_bounded) so there is no pid-reuse window. Uses rustix, cli stays
+  unsafe-forbid.
+- Timeout truncation didn't set capped: a run stopped by the wall-clock backstop
+  looked like a clean complete run. Fixed: anything that stops off the return
+  sentinel is marked capped.
+- Nondeterministic candidate order (HashSet iteration) + first-seen tie-break.
+  Fixed: sorted candidates + a total (name, binary) tie-break, so the same query
+  names the same twin every run.
+
+## Review findings (both mandatory reviewers, all Low/nit, all addressed)
+
+pid-reuse TOCTOU in the first watchdog design -> restructured to kill-before-reap;
+wall deadline vs RLIMIT_CPU on a many-core host -> scaled the deadline with thread
+count; untrusted worker-reply coverage not range-validated -> clamped; a
+serde(default) that is a no-op over postcard -> comment corrected. No High/Medium
+in either review.
+
+## Confirmed sound (0.3.2 delta)
+coverage tracking is observational only (not in Effect/token/complexity/the
+signature, cannot move a fingerprint); the caps sit before the expensive passes;
+the sqlite db-configs are the right knobs in the right order; coverage is advisory
+everywhere (no hidden gate); the worker restructure kills only before reaping and
+bounds both the read phase and the post-reply wait.
