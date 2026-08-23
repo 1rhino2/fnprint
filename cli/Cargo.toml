@@ -23,6 +23,7 @@ fnprint-loader = { path = "../crates/fnprint-loader", version = "0.3.4" }
 fnprint-emu = { path = "../crates/fnprint-emu", version = "0.3.4" }
 fnprint-sandbox = { path = "../crates/fnprint-sandbox", version = "0.3.4" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 postcard = { workspace = true }
 # safe syscall wrapper (already in the tree transitively) for the process-group
 # kill in the worker watchdog. keeps the cli unsafe-forbid, no raw libc::kill.

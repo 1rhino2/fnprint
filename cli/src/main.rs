@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use fnprint_core::{
     dump_traces, eval, index_bytes, match_by_name, query_corpus, source_str, triage, warm_pool,
     EffectTrace, IndexedFunc, Verdict, MIN_COMPLEXITY,
@@ -114,8 +114,24 @@ struct Cli {
     /// platform that can't jail, or debugging. default is always jailed.
     #[arg(long, global = true)]
     no_sandbox: bool,
+    /// output format. human (default) is the readable tables; json is a stable
+    /// machine schema for scripting/plugins; r2 emits a rizin script (query/triage
+    /// only) that renames matched functions.
+    #[arg(long, value_enum, default_value_t = Format::Human, global = true)]
+    format: Format,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+// json/r2 consumers key off this; bump only when a schema shape changes, so it's
+// independent of the fingerprint format.
+const OUTPUT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Format {
+    Human,
+    Json,
+    R2,
 }
 
 #[derive(Subcommand)]
@@ -171,23 +187,24 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let ns = cli.no_sandbox;
+    let fmt = cli.format;
     match cli.cmd {
-        Cmd::Index { binary, out } => cmd_index(&binary, out.as_deref(), ns),
-        Cmd::Match { a, b } => cmd_match(&a, &b, ns),
+        Cmd::Index { binary, out } => cmd_index(&binary, out.as_deref(), ns, fmt),
+        Cmd::Match { a, b } => cmd_match(&a, &b, ns, fmt),
         Cmd::Query {
             target,
             corpus,
             threshold,
-        } => cmd_query(&target, &corpus, threshold, ns),
-        Cmd::Eval { a, b } => cmd_eval(&a, &b, ns),
+        } => cmd_query(&target, &corpus, threshold, ns, fmt),
+        Cmd::Eval { a, b } => cmd_eval(&a, &b, ns, fmt),
         Cmd::Triage {
             target,
             vuln,
             patched,
             min_sim,
             margin,
-        } => cmd_triage(&target, &vuln, &patched, min_sim, margin, ns),
-        Cmd::Dump { binary, func } => cmd_dump(&binary, &func, ns),
+        } => cmd_triage(&target, &vuln, &patched, min_sim, margin, ns, fmt),
+        Cmd::Dump { binary, func } => cmd_dump(&binary, &func, ns, fmt),
     }
 }
 
@@ -466,6 +483,31 @@ fn esc(s: &str) -> String {
     out
 }
 
+// a symbol name emitted into a rizin script is a COMMAND TOKEN, not display text,
+// so esc() (which only defangs terminal escapes) is not enough: spaces, ';', '`',
+// newlines etc. could break out of the `afn <name> <addr>` argument and inject r2
+// commands. map the name to a safe identifier ([A-Za-z0-9_.] only) and prefix it
+// so a crafted name can never be anything but an argument. distinct escaping
+// context from esc(), on purpose.
+fn r2_ident(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    out.push_str("fnp.");
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+// print a serde_json value as one line and return Ok, the json output path.
+fn emit_json(v: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string(v)?);
+    Ok(())
+}
+
 // a compromised db-reader worker controls its reply, same threat model as the
 // index reply: reject any record whose fingerprint isn't a well-formed SIG_LEN
 // signature rather than letting it flow into the comparators as silent noise.
@@ -554,7 +596,10 @@ fn load_index(path: &str, no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
     }
 }
 
-fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool) -> Result<()> {
+fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool, fmt: Format) -> Result<()> {
+    if fmt == Format::R2 {
+        bail!("r2 output is only supported for query and triage");
+    }
     let bytes = read_input(binary)?;
     let funcs = run_index(&bytes, no_sandbox)?;
     let label = Path::new(binary)
@@ -567,14 +612,8 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool) -> Result<()> {
         .iter()
         .filter(|f| f.fp.complexity >= MIN_COMPLEXITY)
         .count();
-    println!(
-        "{}: {} functions, {} named, {} with enough signal",
-        esc(label),
-        funcs.len(),
-        named,
-        usable
-    );
 
+    let mut wrote = None;
     if let Some(path) = out {
         let db = Db::open(path)?;
         for f in &funcs {
@@ -586,15 +625,72 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool) -> Result<()> {
                 &f.fp,
             )?;
         }
+        wrote = Some(path);
+    }
+
+    if fmt == Format::Json {
+        let list: Vec<serde_json::Value> = funcs
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "entry": format!("{:#x}", f.entry),
+                    "name": f.name.as_deref().map(esc),
+                    "source": source_str(f.source),
+                    "complexity": f.fp.complexity,
+                    "shingles": f.fp.shingles,
+                    "capped": f.fp.capped,
+                    "coverage": f.coverage,
+                })
+            })
+            .collect();
+        return emit_json(&serde_json::json!({
+            "schema_version": OUTPUT_SCHEMA_VERSION,
+            "binary": esc(label),
+            "functions": funcs.len(),
+            "named": named,
+            "with_signal": usable,
+            "wrote": wrote,
+            "funcs": list,
+        }));
+    }
+
+    println!(
+        "{}: {} functions, {} named, {} with enough signal",
+        esc(label),
+        funcs.len(),
+        named,
+        usable
+    );
+    if let Some(path) = wrote {
         println!("wrote {} prints -> {}", funcs.len(), path);
     }
     Ok(())
 }
 
-fn cmd_match(a: &str, b: &str, no_sandbox: bool) -> Result<()> {
+fn cmd_match(a: &str, b: &str, no_sandbox: bool, fmt: Format) -> Result<()> {
+    if fmt == Format::R2 {
+        bail!("r2 output is only supported for query and triage");
+    }
     let ia = load_index(a, no_sandbox)?;
     let ib = load_index(b, no_sandbox)?;
     let rep = match_by_name(&ia, &ib);
+
+    if fmt == Format::Json {
+        let changed: Vec<serde_json::Value> = rep
+            .changed
+            .iter()
+            .map(|c| serde_json::json!({ "name": esc(&c.name), "similarity": c.similarity }))
+            .collect();
+        return emit_json(&serde_json::json!({
+            "schema_version": OUTPUT_SCHEMA_VERSION,
+            "compared": rep.compared,
+            "unchanged": rep.same,
+            "changed": changed,
+            "low_signal": rep.low_signal,
+            "only_a": rep.only_a.iter().map(|s| esc(s)).collect::<Vec<_>>(),
+            "only_b": rep.only_b.iter().map(|s| esc(s)).collect::<Vec<_>>(),
+        }));
+    }
 
     println!("compared {} functions present in both", rep.compared);
     println!("  unchanged:  {}", rep.same);
@@ -612,10 +708,49 @@ fn cmd_match(a: &str, b: &str, no_sandbox: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_query(target: &str, corpus: &str, threshold: f64, no_sandbox: bool) -> Result<()> {
+fn cmd_query(
+    target: &str,
+    corpus: &str,
+    threshold: f64,
+    no_sandbox: bool,
+    fmt: Format,
+) -> Result<()> {
     let it = load_index(target, no_sandbox)?;
     let db = load_corpus(corpus, no_sandbox)?;
     let named = query_corpus(&it, &db, threshold)?;
+
+    if fmt == Format::Json {
+        let list: Vec<serde_json::Value> = named
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "entry": format!("{:#x}", n.entry),
+                    "guess": esc(&n.guess),
+                    "from_binary": esc(&n.from_binary),
+                    "similarity": n.similarity,
+                })
+            })
+            .collect();
+        return emit_json(&serde_json::json!({
+            "schema_version": OUTPUT_SCHEMA_VERSION,
+            "threshold": threshold,
+            "named": list,
+        }));
+    }
+
+    if fmt == Format::R2 {
+        // a rizin script: run with `. fnprint.r2` inside r2/rizin on the target.
+        // names go through r2_ident so a crafted symbol can't inject commands.
+        println!(
+            "# fnprint: {} function(s) named at >= {:.0}%",
+            named.len(),
+            threshold * 100.0
+        );
+        for n in &named {
+            println!("afn {} {:#x}", r2_ident(&n.guess), n.entry);
+        }
+        return Ok(());
+    }
 
     if named.is_empty() {
         println!(
@@ -637,10 +772,31 @@ fn cmd_query(target: &str, corpus: &str, threshold: f64, no_sandbox: bool) -> Re
     Ok(())
 }
 
-fn cmd_eval(a: &str, b: &str, no_sandbox: bool) -> Result<()> {
+fn cmd_eval(a: &str, b: &str, no_sandbox: bool, fmt: Format) -> Result<()> {
+    if fmt == Format::R2 {
+        bail!("r2 output is only supported for query and triage");
+    }
     let ia = load_index(a, no_sandbox)?;
     let ib = load_index(b, no_sandbox)?;
     let r = eval(&ia, &ib);
+
+    if fmt == Format::Json {
+        return emit_json(&serde_json::json!({
+            "schema_version": OUTPUT_SCHEMA_VERSION,
+            "scored": r.scored,
+            "rank1_acc": r.rank1_acc(),
+            "recall_at_3": r.recall_at(3),
+            "recall_at_5": r.recall_at(5),
+            "mrr": r.mrr(),
+            "precision": r.precision(),
+            "recall": r.recall(),
+            "abstain_rate": r.abstain_rate(),
+            "tp": r.tp,
+            "fp": r.fp,
+            "abstained": r.abstained,
+        }));
+    }
+
     println!("scored {} functions (had signal + a twin in B)", r.scored);
     println!("  rank-1 accuracy: {:.1}%", r.rank1_acc() * 100.0);
     println!("  recall@3:        {:.1}%", r.recall_at(3) * 100.0);
@@ -669,6 +825,7 @@ fn cmd_triage(
     min_sim: f64,
     margin: f64,
     no_sandbox: bool,
+    fmt: Format,
 ) -> Result<()> {
     let it = load_index(target, no_sandbox)?;
     let vdb = load_corpus(vuln, no_sandbox)?;
@@ -679,6 +836,48 @@ fn cmd_triage(
         .iter()
         .filter(|h| h.verdict == Verdict::Vulnerable)
         .collect();
+
+    if fmt == Format::Json {
+        let verdict_str = |v: &Verdict| match v {
+            Verdict::Vulnerable => "vulnerable",
+            Verdict::Patched => "patched",
+            Verdict::Inconclusive => "inconclusive",
+        };
+        let list: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "entry": format!("{:#x}", h.entry),
+                    "verdict": verdict_str(&h.verdict),
+                    "vuln_sim": h.vuln_sim,
+                    "vuln_name": esc(&h.vuln_name),
+                    "patched_sim": h.patched_sim,
+                    "patched_name": esc(&h.patched_name),
+                    "margin": h.margin(),
+                    "coverage": h.coverage,
+                })
+            })
+            .collect();
+        return emit_json(&serde_json::json!({
+            "schema_version": OUTPUT_SCHEMA_VERSION,
+            "counts": {
+                "vulnerable": vulns.len(),
+                "patched": hits.iter().filter(|h| h.verdict == Verdict::Patched).count(),
+                "inconclusive": hits.iter().filter(|h| h.verdict == Verdict::Inconclusive).count(),
+            },
+            "hits": list,
+        }));
+    }
+
+    if fmt == Format::R2 {
+        // name the vuln-leaning targets in rizin so the analyst opens them first.
+        println!("# fnprint triage: {} vuln-leaning function(s)", vulns.len());
+        for h in &vulns {
+            println!("afn {} {:#x}", r2_ident(&h.vuln_name), h.entry);
+        }
+        return Ok(());
+    }
+
     println!(
         "{} functions triaged: {} look vulnerable, {} patched, {} inconclusive",
         hits.len(),
@@ -725,9 +924,19 @@ fn cmd_triage(
     Ok(())
 }
 
-fn cmd_dump(binary: &str, func: &str, no_sandbox: bool) -> Result<()> {
+fn cmd_dump(binary: &str, func: &str, no_sandbox: bool, fmt: Format) -> Result<()> {
+    if fmt == Format::R2 {
+        bail!("r2 output is only supported for query and triage");
+    }
     let bytes = read_input(binary)?;
     let lines = run_dump(&bytes, func, no_sandbox)?;
+    if fmt == Format::Json {
+        return emit_json(&serde_json::json!({
+            "schema_version": OUTPUT_SCHEMA_VERSION,
+            "func": esc(func),
+            "lines": lines.iter().map(|l| esc(l)).collect::<Vec<_>>(),
+        }));
+    }
     for line in &lines {
         println!("{}", esc(line));
     }
@@ -736,7 +945,23 @@ fn cmd_dump(binary: &str, func: &str, no_sandbox: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::esc;
+    use super::{esc, r2_ident};
+
+    #[test]
+    fn r2_ident_strips_injection() {
+        // a crafted symbol name must not be able to break out of the afn argument
+        // and inject r2 commands. everything outside [A-Za-z0-9_.] becomes '_'.
+        assert_eq!(r2_ident("adler32_z"), "fnp.adler32_z");
+        // every char outside [A-Za-z0-9_.] (space, ;, -, /) becomes _
+        assert_eq!(r2_ident("x; rm -rf /"), "fnp.x__rm__rf__");
+        // no spaces, semicolons, backticks, or newlines survive
+        let bad = r2_ident("a b;c`d`\ne");
+        assert!(!bad.contains(' '));
+        assert!(!bad.contains(';'));
+        assert!(!bad.contains('`'));
+        assert!(!bad.contains('\n'));
+        assert!(bad.starts_with("fnp."));
+    }
 
     #[test]
     fn esc_defangs_terminal_escapes() {
