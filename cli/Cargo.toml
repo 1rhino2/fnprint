@@ -1,6 +1,6 @@
 [package]
 name = "fnprint"
-version = "0.3.3"
+version = "0.3.4"
 edition.workspace = true
 license.workspace = true
 description = "Behavioral function fingerprinting: name functions in stripped binaries and patch-diff builds by what they do, not their bytes"
@@ -17,11 +17,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-fnprint-core = { path = "../crates/fnprint-core", version = "0.3.2" }
-fnprint-db = { path = "../crates/fnprint-db", version = "0.3.2" }
-fnprint-loader = { path = "../crates/fnprint-loader", version = "0.3.2" }
-fnprint-emu = { path = "../crates/fnprint-emu", version = "0.3.2" }
-fnprint-sandbox = { path = "../crates/fnprint-sandbox", version = "0.3.2" }
+fnprint-core = { path = "../crates/fnprint-core", version = "0.3.4" }
+fnprint-db = { path = "../crates/fnprint-db", version = "0.3.4" }
+fnprint-loader = { path = "../crates/fnprint-loader", version = "0.3.4" }
+fnprint-emu = { path = "../crates/fnprint-emu", version = "0.3.4" }
+fnprint-sandbox = { path = "../crates/fnprint-sandbox", version = "0.3.4" }
 serde = { workspace = true }
 postcard = { workspace = true }
 # safe syscall wrapper (already in the tree transitively) for the process-group

@@ -4,13 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Microexecution engine that records function behavior for fnprint"
+keywords = ["microexecution", "emulation", "unicorn", "reverse-engineering", "binary-analysis"]
+categories = ["emulators", "development-tools::debugging"]
 repository.workspace = true
 
 [dependencies]
 unicorn-engine = { workspace = true }
 capstone = { workspace = true }
-fnprint-trace = { path = "../fnprint-trace", version = "0.3.2" }
-fnprint-loader = { path = "../fnprint-loader", version = "0.3.2" }
+fnprint-trace = { path = "../fnprint-trace", version = "0.3.4" }
+fnprint-loader = { path = "../fnprint-loader", version = "0.3.4" }
 
 [lints]
 workspace = true

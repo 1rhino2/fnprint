@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "ELF loading and function discovery for fnprint"
+keywords = ["elf", "binary-analysis", "reverse-engineering", "loader"]
+categories = ["development-tools::debugging", "parser-implementations"]
 repository.workspace = true
 
 [dependencies]

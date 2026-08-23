@@ -4,11 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "MinHash/LSH behavioral fingerprints for fnprint"
+keywords = ["fingerprint", "minhash", "lsh", "similarity", "reverse-engineering"]
+categories = ["algorithms", "development-tools::debugging"]
 repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
-fnprint-trace = { path = "../fnprint-trace", version = "0.3.2" }
+fnprint-trace = { path = "../fnprint-trace", version = "0.3.4" }
 
 [lints]
 workspace = true

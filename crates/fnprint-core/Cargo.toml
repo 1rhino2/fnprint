@@ -4,17 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Index, match, and query pipelines for fnprint"
+keywords = ["reverse-engineering", "binary-analysis", "fingerprint", "patch-diffing", "function-matching"]
+categories = ["development-tools::debugging"]
 repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
-fnprint-loader = { path = "../fnprint-loader", version = "0.3.2" }
-fnprint-emu = { path = "../fnprint-emu", version = "0.3.2" }
-fnprint-sig = { path = "../fnprint-sig", version = "0.3.2" }
-fnprint-db = { path = "../fnprint-db", version = "0.3.2" }
-fnprint-trace = { path = "../fnprint-trace", version = "0.3.2" }
+fnprint-loader = { path = "../fnprint-loader", version = "0.3.4" }
+fnprint-emu = { path = "../fnprint-emu", version = "0.3.4" }
+fnprint-sig = { path = "../fnprint-sig", version = "0.3.4" }
+fnprint-db = { path = "../fnprint-db", version = "0.3.4" }
+fnprint-trace = { path = "../fnprint-trace", version = "0.3.4" }
 
 [lints]
 workspace = true

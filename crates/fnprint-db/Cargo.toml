@@ -4,13 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "SQLite fingerprint store for fnprint"
+keywords = ["fingerprint", "sqlite", "lsh", "reverse-engineering", "binary-analysis"]
+categories = ["database", "development-tools::debugging"]
 repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
-fnprint-sig = { path = "../fnprint-sig", version = "0.3.2" }
+fnprint-sig = { path = "../fnprint-sig", version = "0.3.4" }
 
 # fnprint-db is the ONE crate that is not unsafe-forbid. deserialize()'s only
 # constructor for its owned buffer is an unsafe FFI (sqlite3_malloc + copy), so

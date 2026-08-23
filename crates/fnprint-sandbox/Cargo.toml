@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "seccomp + rlimit process jail for fnprint's untrusted worker"
+keywords = ["seccomp", "sandbox", "rlimit", "jail", "security"]
+categories = ["os::linux-apis", "development-tools::debugging"]
 repository.workspace = true
 
 [dependencies]
