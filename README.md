@@ -129,6 +129,25 @@ fnprint dump <binary> <func>            print the recorded effect trace (debuggi
 `match` and `query` take either an ELF or a `.db` you built with `index`, so you
 can fingerprint a corpus once and reuse it.
 
+## machine output
+
+every command takes a global `--format`:
+
+```
+fnprint query mystery.so --corpus corpus.db --format json > names.json
+fnprint query mystery.so --corpus corpus.db --format r2   > fnprint.r2
+```
+
+`json` is a stable schema for scripts (and the Ghidra import stub in `contrib/`),
+`r2` emits `afn` rename commands you run inside rizin/radare2 with `. fnprint.r2`.
+symbol names from the target are sanitized before they hit either, so a crafted
+name can't inject r2 commands. schemas and setup are in
+[docs/integrations.md](docs/integrations.md).
+
+indexing is single-process by default. `FNPRINT_SHARDS=N fnprint index ...` spreads
+a large index across N jailed workers; the corpus is byte-identical whatever N is.
+it only helps on big, function-rich binaries, so it's off unless you ask for it.
+
 ## accuracy
 
 rank-1 accuracy is: for a function in build A, rank every function in build B by
@@ -195,7 +214,8 @@ architecture-neutral, which is the groundwork for matching across CPUs.
   cross-build accuracy in testing, so it needs a path-consistency filter before
   it earns its keep.
 - pe and mach-o loaders.
-- ghidra / ida plugins that call the cli and rename matched functions in place.
+- rizin/radare2 export ships now (`--format r2`); a real ghidra plugin is next.
+  there's an experimental jython import stub in `contrib/` in the meantime.
 
 ## license
 

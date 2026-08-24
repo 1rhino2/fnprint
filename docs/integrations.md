@@ -47,3 +47,18 @@ enter a JSON string, so a crafted name is inert even in a downstream viewer.
 - `dump`: `{schema_version, func, lines:[...]}`
 
 `entry` is a hex string (`0x...`); similarities and coverage are floats in [0,1].
+
+## Parallel indexing (opt-in)
+
+`index` can shard across several jailed worker processes. It is off by default:
+each worker reloads the whole ELF and runs its own interpreter (TCI) VM, so on
+typical binaries the per-worker load plus cache contention across many VMs cancels
+the parallelism (measured neutral on small binaries, slower on a mid-size lib). It
+only pays off on large, function-rich corpora, so the default stays single-process
+and byte-identical to older releases.
+
+    FNPRINT_SHARDS=8 fnprint index big-corpus.so -o corpus.db
+
+The output is byte-identical regardless of shard count (functions are statically
+assigned by position and the merge is re-sorted), so sharding never changes the
+corpus, only how the work is spread.

@@ -432,18 +432,19 @@ fn parse_shard(spec: Option<&str>) -> (usize, usize) {
 
 // how many jailed worker processes to shard an index across. emulation is
 // serialized inside each process (shared qemu TCG state), so parallelism comes
-// from running several processes; one per core, capped, since each carries a
-// softmmu/context cost. FNPRINT_SHARDS overrides (used by the determinism gate).
+// from running several processes. this is OPT-IN via FNPRINT_SHARDS: each worker
+// reloads the whole ELF and runs its own TCI (interpreter) VM, so on typical
+// binaries the per-worker load + cache contention across many interpreter VMs
+// eats the gain (measured: neutral on small, ~0.8x on a mid-size lib). it only
+// pays off on large, function-rich corpora, so the default stays single-process
+// (identical to pre-0.4.0). set FNPRINT_SHARDS=N to shard a big index.
 fn shard_count() -> usize {
     if let Ok(v) = std::env::var("FNPRINT_SHARDS") {
         if let Ok(n) = v.parse::<usize>() {
             return n.clamp(1, 64);
         }
     }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, 16)
+    1
 }
 
 // coverage is advisory and never gates, but a popped worker controls the reply, so
