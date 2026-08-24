@@ -8,13 +8,14 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use fnprint_core::{
-    dump_traces, eval, index_bytes, match_by_name, query_corpus, source_str, triage, warm_pool,
-    EffectTrace, IndexedFunc, Verdict, MIN_COMPLEXITY,
+    dump_traces, eval, index_bytes, index_bytes_shard, match_by_name, query_corpus, source_str,
+    triage, warm_pool, EffectTrace, IndexedFunc, Verdict, MIN_COMPLEXITY,
 };
 use fnprint_db::{Db, FuncRec, MemCorpus};
 use fnprint_emu::Config;
 use fnprint_loader::FuncSource;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 // hard caps on the privsep pipe so neither side can be pushed into an unbounded
 // alloc. an ELF bigger than this we refuse; a worker reply bigger than this we
@@ -233,10 +234,14 @@ fn worker_main(op: &str, func: Option<&str>) -> Result<()> {
     // run the requested op, folding any error into the reply. this path parses
     // and micro-executes hostile bytes, so it must never panic the process.
     let reply = match op {
-        "index" => match index_bytes(&input, Config::default()) {
-            Ok(funcs) => WorkerReply::IndexOk(funcs),
-            Err(e) => WorkerReply::Err(format!("{e:#}")),
-        },
+        "index" => {
+            // func carries the shard as "idx/count" (absent -> whole binary).
+            let (idx, cnt) = parse_shard(func);
+            match index_bytes_shard(&input, Config::default(), idx, cnt) {
+                Ok(funcs) => WorkerReply::IndexOk(funcs),
+                Err(e) => WorkerReply::Err(format!("{e:#}")),
+            }
+        }
         "dump" => {
             let name = func.unwrap_or_default();
             match dump_traces(&input, name, Config::default()) {
@@ -409,32 +414,146 @@ fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply>
     Ok(reply)
 }
 
+// parse the "idx/count" shard spec the parent hands an index worker. absent or
+// malformed -> the whole binary (0 of 1), so the worker path stays fail-safe.
+fn parse_shard(spec: Option<&str>) -> (usize, usize) {
+    let s = match spec {
+        Some(s) => s,
+        None => return (0, 1),
+    };
+    let mut it = s.split('/');
+    let idx = it.next().and_then(|v| v.parse::<usize>().ok());
+    let cnt = it.next().and_then(|v| v.parse::<usize>().ok());
+    match (idx, cnt) {
+        (Some(i), Some(c)) if c >= 1 && i < c => (i, c),
+        _ => (0, 1),
+    }
+}
+
+// how many jailed worker processes to shard an index across. emulation is
+// serialized inside each process (shared qemu TCG state), so parallelism comes
+// from running several processes; one per core, capped, since each carries a
+// softmmu/context cost. FNPRINT_SHARDS overrides (used by the determinism gate).
+fn shard_count() -> usize {
+    if let Ok(v) = std::env::var("FNPRINT_SHARDS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.clamp(1, 64);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16)
+}
+
+// coverage is advisory and never gates, but a popped worker controls the reply, so
+// sanitize NaN/negative/huge to "assume covered" before it can render a garbage %.
+fn sanitize_coverage(funcs: &mut [IndexedFunc]) {
+    for f in funcs {
+        f.coverage = if f.coverage.is_finite() {
+            f.coverage.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+    }
+}
+
 // index a binary's bytes, jailed by default. --no-sandbox runs it in-process.
 fn run_index(bytes: &[u8], no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
     if no_sandbox {
         eprintln!("warning: --no-sandbox, running the emulator without the jail");
         return index_bytes(bytes, Config::default());
     }
-    match run_worker("index", None, bytes)? {
-        WorkerReply::IndexOk(mut funcs) => {
-            validate_reply_fps(&funcs)?;
-            // a popped worker controls the reply: coverage is advisory and never
-            // gates, but sanitize it anyway (NaN/negative/huge -> assume covered)
-            // so a crafted value can't render a garbage % in the triage table.
-            for f in &mut funcs {
-                f.coverage = if f.coverage.is_finite() {
-                    f.coverage.clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
+    let n = shard_count();
+    if n <= 1 {
+        // single worker: exactly the old path (whole binary, one jailed process).
+        return match run_worker("index", None, bytes)? {
+            WorkerReply::IndexOk(mut funcs) => {
+                validate_reply_fps(&funcs)?;
+                sanitize_coverage(&mut funcs);
+                Ok(funcs)
             }
-            Ok(funcs)
-        }
-        // the worker's error text is built from the parser, which handles attacker
-        // bytes; escape it so a crafted error can't smuggle terminal sequences.
-        WorkerReply::Err(e) => bail!("{}", esc(&e)),
-        _ => bail!("worker returned the wrong reply kind for index"),
+            WorkerReply::Err(e) => bail!("{}", esc(&e)),
+            _ => bail!("worker returned the wrong reply kind for index"),
+        };
     }
+    run_workers_sharded(bytes, n)
+}
+
+// spawn N jailed workers concurrently, one per shard, and merge. each worker
+// jails itself the same way; a failure in any shard fails the whole index (no
+// partial corpus). the merged result is sorted by (entry, name, source) to
+// reconstruct the single-process order, so the corpus is byte-identical whatever
+// N is (fingerprints are per-function independent + the func list is sorted).
+fn run_workers_sharded(bytes: &[u8], n: usize) -> Result<Vec<IndexedFunc>> {
+    // share the input across worker threads instead of cloning it N times (the
+    // ELF can be up to MAX_INPUT); each thread hands the same bytes to its child.
+    let shared = Arc::new(bytes.to_vec());
+    let handles: Vec<_> = (0..n)
+        .map(|i| {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let spec = format!("{i}/{n}");
+                run_worker("index", Some(&spec), &shared)
+            })
+        })
+        .collect();
+
+    let mut all: Vec<IndexedFunc> = Vec::new();
+    let mut first_err: Option<anyhow::Error> = None;
+    for h in handles {
+        // join every thread even after an error so no child is left orphaned.
+        let res = match h.join() {
+            Ok(r) => r,
+            Err(_) => {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("a shard worker thread panicked"));
+                }
+                continue;
+            }
+        };
+        match res {
+            Ok(WorkerReply::IndexOk(mut funcs)) => {
+                if let Err(e) = validate_reply_fps(&funcs) {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    continue;
+                }
+                sanitize_coverage(&mut funcs);
+                all.append(&mut funcs);
+            }
+            Ok(WorkerReply::Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("{}", esc(&e)));
+                }
+            }
+            Ok(_) => {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("worker returned the wrong reply kind"));
+                }
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    // fail-closed: any shard failure aborts the whole index, no partial corpus.
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    // canonical order == single-process order: the loader sorts funcs by entry
+    // (deduped), and rayon collect preserves that, so sorting the merged shards by
+    // entry (name/source break ties defensively) reproduces it byte-for-byte.
+    all.sort_by(|a, b| {
+        a.entry
+            .cmp(&b.entry)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| source_str(a.source).cmp(source_str(b.source)))
+    });
+    Ok(all)
 }
 
 // a compromised worker controls its reply. every fingerprint must carry a

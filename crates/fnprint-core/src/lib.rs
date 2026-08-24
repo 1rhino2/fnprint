@@ -81,10 +81,32 @@ pub fn source_str(s: FuncSource) -> &'static str {
 
 /// micro-execute + fingerprint every discovered function in an ELF blob.
 pub fn index_bytes(bytes: &[u8], cfg: Config) -> Result<Vec<IndexedFunc>> {
+    index_bytes_shard(bytes, cfg, 0, 1)
+}
+
+/// index only the functions assigned to shard `shard_idx` of `shard_count`. the
+/// loader's function list is deterministically sorted+deduped, so assigning the
+/// function at sorted position `i` to shard `i % shard_count` partitions the work
+/// identically in every process with no coordination. run one shard per jailed
+/// worker process to get real parallelism back (the emu lock only serializes
+/// within a process, and separate processes share no qemu TCG state). `(0, 1)`
+/// is the whole binary, i.e. the old single-process behavior. the caller merges
+/// the shards and sorts by entry to reconstruct the single-process order, so the
+/// resulting corpus is byte-identical regardless of shard_count.
+pub fn index_bytes_shard(
+    bytes: &[u8],
+    cfg: Config,
+    shard_idx: usize,
+    shard_count: usize,
+) -> Result<Vec<IndexedFunc>> {
+    let shard_count = shard_count.max(1);
+    let shard_idx = shard_idx.min(shard_count - 1);
     let loaded = fnprint_loader::load(bytes)?;
     let image = &loaded.image;
 
-    // entry -> name, so stubbed calls can be resolved to a symbol
+    // entry -> name, so stubbed calls can be resolved to a symbol. every shard
+    // builds the FULL symbol map (cheap) so stubbed-call naming is complete no
+    // matter which functions this shard actually emulates.
     let mut symbols: HashMap<u64, String> = HashMap::new();
     for f in &loaded.funcs {
         if let Some(n) = &f.name {
@@ -95,6 +117,12 @@ pub fn index_bytes(bytes: &[u8], cfg: Config) -> Result<Vec<IndexedFunc>> {
     let out: Vec<IndexedFunc> = loaded
         .funcs
         .par_iter()
+        .enumerate()
+        // shard assignment is by position in the deterministic sorted list, so it
+        // is identical in every worker. the size/code filter is applied after, so
+        // a function's shard never depends on which others have code.
+        .filter(|(i, _)| i % shard_count == shard_idx)
+        .map(|(_, f)| f)
         .filter(|f| f.size > 0 && image.code_at(f.entry, 1).is_some())
         .map(|f: &Func| {
             // hold the emu lock across engine build + run: engine creation also
