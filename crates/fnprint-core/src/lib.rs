@@ -230,8 +230,14 @@ pub fn match_by_name(a: &[IndexedFunc], b: &[IndexedFunc]) -> MatchReport {
             rep.only_b.push(name.to_string());
         }
     }
-    rep.changed
-        .sort_by(|x, y| x.similarity.total_cmp(&y.similarity));
+    // name tiebreak so equal-similarity ties are stable: changed is built from
+    // HashMap iteration (nondeterministic), and similarity-only sort would leave
+    // ties in that random order. query/eval already tiebreak on name; match didn't.
+    rep.changed.sort_by(|x, y| {
+        x.similarity
+            .total_cmp(&y.similarity)
+            .then_with(|| x.name.cmp(&y.name))
+    });
     rep.only_a.sort();
     rep.only_b.sort();
     rep
