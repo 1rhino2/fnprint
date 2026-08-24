@@ -5,7 +5,7 @@
 # (it uses the Jython interpreter Ghidra ships).
 #
 # This is the Ghidra side of the `--format json` contract documented in
-# docs/ghidra-import.md. The rizin path (`fnprint query --format r2`) is the
+# docs/integrations.md. The rizin path (`fnprint query --format r2`) is the
 # supported, no-install integration; this is a starting point for a Ghidra plugin.
 #
 # Usage:
