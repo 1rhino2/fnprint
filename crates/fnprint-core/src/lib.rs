@@ -1,7 +1,7 @@
 //! Index / match / query, built on the loader + emulator + fingerprint + db.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use fnprint_db::{Corpus, Db};
@@ -113,6 +113,9 @@ pub fn index_bytes_shard(
             symbols.insert(f.entry, n.clone());
         }
     }
+    // one Arc for the whole shard: each per-function run clones the handle, not
+    // the map. built once here, shared read-only across the rayon workers.
+    let symbols = Arc::new(symbols);
 
     let out: Vec<IndexedFunc> = loaded
         .funcs
@@ -574,6 +577,7 @@ pub fn dump_traces(
             symbols.insert(f.entry, n.clone());
         }
     }
+    let symbols = Arc::new(symbols);
     let f = loaded
         .funcs
         .iter()

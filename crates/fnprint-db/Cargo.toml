@@ -12,7 +12,7 @@ repository.workspace = true
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
-fnprint-sig = { path = "../fnprint-sig", version = "0.4.1" }
+fnprint-sig = { path = "../fnprint-sig", version = "0.4.2" }
 
 # fnprint-db is the ONE crate that is not unsafe-forbid. deserialize()'s only
 # constructor for its owned buffer is an unsafe FFI (sqlite3_malloc + copy), so

@@ -49,15 +49,19 @@ const WORKER_TOKEN: &str = "__worker";
 //
 // it MUST sit strictly above the worker's own CPU budget so RLIMIT_CPU (the
 // intended CPU bound) always fires first: the worker jail sets
-// RLIMIT_CPU = 120 * threads cpu-seconds, and emulation is serialized behind a
-// lock, so a legit large index can burn up to ~120 * threads WALL seconds. a
+// RLIMIT_CPU = 120 * min(threads, 16) cpu-seconds, and emulation is serialized
+// behind a lock, so a legit large index can burn up to ~that many WALL seconds. a
 // flat wall cap below that would false-abort a big index on a many-core box. so
-// scale with the same thread count and add margin; this only ever catches a true
-// hang (a blocked syscall consuming no CPU, which RLIMIT_CPU can never catch).
+// scale with the SAME clamped thread count and add margin; this only ever catches
+// a true hang (a blocked syscall consuming no CPU, which RLIMIT_CPU can't catch).
+// the clamp (mirrored from the sandbox's CPU_THREAD_CLAMP) keeps the ordering
+// invariant AND stops the deadline from ballooning to hours on a big server.
+const DEADLINE_THREAD_CLAMP: u64 = 16;
 fn worker_deadline() -> Duration {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get() as u64)
-        .unwrap_or(8);
+        .unwrap_or(8)
+        .min(DEADLINE_THREAD_CLAMP);
     Duration::from_secs(120u64.saturating_mul(threads).saturating_add(300))
 }
 
@@ -212,6 +216,11 @@ fn main() -> Result<()> {
 // ---- jailed worker ----------------------------------------------------------
 
 fn worker_main(op: &str, func: Option<&str>) -> Result<()> {
+    // first thing, before anything else touches inherited state: drop fds above
+    // std{in,out,err}, arm pdeathsig, and bail if the parent already died. this
+    // fails closed (we never read the input if it errors).
+    fnprint_sandbox::harden_worker_preinput().context("worker preinput hardening")?;
+
     // spin up the rayon pool before we jail so the parallel index is warm and
     // doesn't pay thread-spawn cost under the sandbox.
     warm_thread_pool();
@@ -299,9 +308,14 @@ fn emit(reply: &WorkerReply) -> Result<()> {
 // re-exec self as the jailed worker, hand it the bytes over stdin, read its
 // postcard reply back. the input is written on a separate thread so a large ELF
 // can't deadlock against the reply on a full pipe.
-fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply> {
+fn run_worker(op: &str, func: Option<&str>, input: Arc<Vec<u8>>) -> Result<WorkerReply> {
     let exe = std::env::current_exe().context("locating self for worker re-exec")?;
     let mut cmd = Command::new(exe);
+    // the worker inherits nothing from our environment. it only needs argv (op +
+    // optional shard/func) and the stdin payload; a stray var (LD_PRELOAD,
+    // proxy/locale/tmpdir settings, anything the caller exported) is ambient
+    // authority the jailed parser shouldn't get to read or act on. clear it all.
+    cmd.env_clear();
     cmd.arg(WORKER_TOKEN).arg(op);
     if let Some(f) = func {
         cmd.arg(f);
@@ -325,7 +339,10 @@ fn run_worker(op: &str, func: Option<&str>, input: &[u8]) -> Result<WorkerReply>
     // stdin writer: feed the payload on its own thread so a large ELF can't
     // deadlock against the reply on a full pipe.
     let mut stdin = child.stdin.take().context("worker stdin")?;
-    let payload = input.to_vec();
+    // clone the Arc handle, not the bytes: the sharded path spawns N workers off
+    // one shared buffer, so a per-writer deep copy meant N extra full-ELF copies
+    // resident in the parent at once. the handle move keeps it to the single Arc.
+    let payload = Arc::clone(&input);
     let writer = std::thread::spawn(move || {
         // ignore the error: if the worker died early we'll see it in wait()
         let _ = stdin.write_all(&payload);
@@ -459,16 +476,40 @@ fn sanitize_coverage(funcs: &mut [IndexedFunc]) {
     }
 }
 
+// each shard worker re-reads the WHOLE ELF into its own address space, so the
+// system-wide footprint of a sharded index is input_len * shard_count, not just
+// input_len. bound that product: past this, trim the shard count (never below 1)
+// so a big ELF sharded wide can't commit tens of GiB across the child processes.
+const MAX_AGGREGATE_INPUT: u64 = 2 << 30; // 2 GiB summed across shard children
+
+// trim the requested shard count so input_len * shards stays under the aggregate
+// budget. the corpus is byte-identical at any shard count (per-function prints +
+// a sorted merge), so this only trades parallelism, never output.
+fn clamp_shards_for_input(requested: usize, input_len: u64) -> usize {
+    if input_len == 0 {
+        return requested;
+    }
+    let max_by_mem = (MAX_AGGREGATE_INPUT / input_len).max(1);
+    (requested as u64).min(max_by_mem) as usize
+}
+
 // index a binary's bytes, jailed by default. --no-sandbox runs it in-process.
 fn run_index(bytes: &[u8], no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
     if no_sandbox {
         eprintln!("warning: --no-sandbox, running the emulator without the jail");
         return index_bytes(bytes, Config::default());
     }
-    let n = shard_count();
+    let requested = shard_count();
+    let n = clamp_shards_for_input(requested, bytes.len() as u64);
+    if n < requested {
+        eprintln!(
+            "note: reduced shards {requested} -> {n} to bound memory for a {}-byte input",
+            bytes.len()
+        );
+    }
     if n <= 1 {
         // single worker: exactly the old path (whole binary, one jailed process).
-        return match run_worker("index", None, bytes)? {
+        return match run_worker("index", None, Arc::new(bytes.to_vec()))? {
             WorkerReply::IndexOk(mut funcs) => {
                 validate_reply_fps(&funcs)?;
                 sanitize_coverage(&mut funcs);
@@ -487,15 +528,16 @@ fn run_index(bytes: &[u8], no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
 // reconstruct the single-process order, so the corpus is byte-identical whatever
 // N is (fingerprints are per-function independent + the func list is sorted).
 fn run_workers_sharded(bytes: &[u8], n: usize) -> Result<Vec<IndexedFunc>> {
-    // share the input across worker threads instead of cloning it N times (the
-    // ELF can be up to MAX_INPUT); each thread hands the same bytes to its child.
+    // one buffer shared across all N worker threads (the ELF can be up to
+    // MAX_INPUT); each thread clones only the Arc handle and streams the same
+    // bytes to its child, so the parent holds exactly one copy, not N.
     let shared = Arc::new(bytes.to_vec());
     let handles: Vec<_> = (0..n)
         .map(|i| {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || {
                 let spec = format!("{i}/{n}");
-                run_worker("index", Some(&spec), &shared)
+                run_worker("index", Some(&spec), shared)
             })
         })
         .collect();
@@ -574,7 +616,7 @@ fn run_dump(bytes: &[u8], func: &str, no_sandbox: bool) -> Result<Vec<String>> {
         eprintln!("warning: --no-sandbox, running the emulator without the jail");
         return Ok(render_traces(&dump_traces(bytes, func, Config::default())?));
     }
-    match run_worker("dump", Some(func), bytes)? {
+    match run_worker("dump", Some(func), Arc::new(bytes.to_vec()))? {
         WorkerReply::DumpOk(lines) => Ok(lines),
         WorkerReply::Err(e) => bail!("{}", esc(&e)),
         _ => bail!("worker returned the wrong reply kind for dump"),
@@ -649,11 +691,11 @@ fn load_corpus_records(path: &str, no_sandbox: bool) -> Result<Vec<FuncRec>> {
     if no_sandbox {
         eprintln!("warning: --no-sandbox, parsing corpus with in-process sqlite (unjailed)");
         return Db::open(path)
-            .with_context(|| format!("opening corpus {path}"))?
+            .with_context(|| format!("opening corpus {}", esc(path)))?
             .all();
     }
     let bytes = read_input(path)?;
-    match run_worker("dbload", None, &bytes)? {
+    match run_worker("dbload", None, Arc::new(bytes))? {
         WorkerReply::DbOk(recs) => {
             validate_corpus_records(&recs)?;
             Ok(recs)
@@ -674,22 +716,38 @@ fn load_corpus(path: &str, no_sandbox: bool) -> Result<MemCorpus> {
 }
 
 // read a file we're about to hand the jailed worker, refusing anything over
-// MAX_INPUT. check metadata first so a huge file can't OOM the parent on the read
-// itself (the worker's own stdin cap only fires after the parent holds the bytes).
-// metadata is best-effort (a proc/pipe path may report 0), so the post-read length
-// check stays as the backstop.
+// MAX_INPUT. open ONCE and stat + read through the same handle: a path stat'd and
+// then re-read is a TOCTOU window where a symlink swap could size-check one file
+// and read another. we also reject non-regular files: a device or fifo (e.g.
+// /dev/zero) reports len 0, sails past a size check, then streams forever, so a
+// naive read-to-end would spin or hang the parent. finally the read itself is
+// capped at MAX_INPUT+1 so a file that grows after the stat still can't push the
+// parent past the cap before the worker's own stdin cap would fire.
 fn read_input(path: &str) -> Result<Vec<u8>> {
-    if let Ok(md) = fs::metadata(path) {
-        if md.len() > MAX_INPUT {
-            bail!(
-                "{path} is {} bytes, over the {MAX_INPUT} byte cap",
-                md.len()
-            );
-        }
+    // esc the path in every message: a crafted filename (operator sweeping a
+    // directory of attacker-named files) could otherwise smuggle terminal escapes
+    // through an error line.
+    let f = fs::File::open(path).with_context(|| format!("opening {}", esc(path)))?;
+    let md = f
+        .metadata()
+        .with_context(|| format!("stat {}", esc(path)))?;
+    if !md.is_file() {
+        bail!("{} is not a regular file", esc(path));
     }
-    let bytes = fs::read(path).with_context(|| format!("reading {path}"))?;
-    if bytes.len() as u64 > MAX_INPUT {
-        bail!("{path} over the {MAX_INPUT} byte cap");
+    if md.len() > MAX_INPUT {
+        bail!(
+            "{} is {} bytes, over the {MAX_INPUT} byte cap",
+            esc(path),
+            md.len()
+        );
+    }
+    let mut bytes = Vec::new();
+    let n = f
+        .take(MAX_INPUT + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", esc(path)))?;
+    if n as u64 > MAX_INPUT {
+        bail!("{} over the {MAX_INPUT} byte cap", esc(path));
     }
     Ok(bytes)
 }
@@ -782,7 +840,7 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool, fmt: Format) -> 
         usable
     );
     if let Some(path) = wrote {
-        println!("wrote {} prints -> {}", funcs.len(), path);
+        println!("wrote {} prints -> {}", funcs.len(), esc(path));
     }
     Ok(())
 }
@@ -816,8 +874,8 @@ fn cmd_match(a: &str, b: &str, no_sandbox: bool, fmt: Format) -> Result<()> {
     println!("  unchanged:  {}", rep.same);
     println!("  changed:    {}", rep.changed.len());
     println!("  low-signal: {} (too small to judge)", rep.low_signal);
-    println!("  only in {}: {}", a, rep.only_a.len());
-    println!("  only in {}: {}", b, rep.only_b.len());
+    println!("  only in {}: {}", esc(a), rep.only_a.len());
+    println!("  only in {}: {}", esc(b), rep.only_b.len());
 
     if !rep.changed.is_empty() {
         println!("\nchanged behavior (lowest similarity first):");
@@ -1081,6 +1139,40 @@ mod tests {
         assert!(!bad.contains('`'));
         assert!(!bad.contains('\n'));
         assert!(bad.starts_with("fnp."));
+    }
+
+    #[test]
+    fn shard_clamp_bounds_aggregate_memory() {
+        use super::{clamp_shards_for_input, MAX_AGGREGATE_INPUT};
+        // small input: the requested shard count passes through untouched
+        assert_eq!(clamp_shards_for_input(8, 1024), 8);
+        // zero length: no division, pass through
+        assert_eq!(clamp_shards_for_input(8, 0), 8);
+        // an input at half the budget allows at most 2 shards
+        assert_eq!(clamp_shards_for_input(16, MAX_AGGREGATE_INPUT / 2), 2);
+        // an input over the whole budget still allows 1, never 0
+        assert_eq!(clamp_shards_for_input(16, MAX_AGGREGATE_INPUT + 1), 1);
+    }
+
+    #[test]
+    fn read_input_rejects_non_regular_file() {
+        // /dev/zero reports length 0 then streams forever; must be refused up front,
+        // not read into an unbounded allocation.
+        let e = super::read_input("/dev/zero")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("not a regular file"), "got: {e}");
+    }
+
+    #[test]
+    fn read_input_reads_a_regular_file() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("fnprint_ri_{}.bin", std::process::id()));
+        std::fs::write(&p, b"\x7fELFhello").unwrap();
+        let got = super::read_input(p.to_str().unwrap());
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(got.unwrap(), b"\x7fELFhello");
     }
 
     #[test]

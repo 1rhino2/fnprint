@@ -219,3 +219,111 @@ signature, cannot move a fingerprint); the caps sit before the expensive passes;
 the sqlite db-configs are the right knobs in the right order; coverage is advisory
 everywhere (no hidden gate); the worker restructure kills only before reaping and
 bounds both the read phase and the post-reply wait.
+
+# 0.4.2 audit (external audit intake + fix, 2026-08-26)
+
+An external security audit of 0.4.1 (commit 7d892e47) reported 11 confirmed
+findings (1 High, 8 Medium, 2 Low). All 11 were fixed in 0.4.2 and each fix was
+re-reviewed by two independent mandatory reviewers (source-read, per-finding
+verification). Both reviewers returned clean: no memory-safety, escape, injection,
+or panic-on-untrusted-value defect; determinism (byte-identical corpus across runs
+and shard counts) preserved; fail-closed throughout. Written 2026-08-26.
+
+## Findings and fixes
+
+### FNP-001 (High): cross-process kill / cpu-pin primitives in the allow set
+`tgkill` and `sched_setaffinity` were on the seccomp allowlist. Both take a target
+pid/tid as a runtime arg BPF can't pin to self, so a popped worker could SIGKILL
+the trusted parent (or any same-uid process) or pin any process's CPU. Fixed: both
+dropped from the allow set, so they soft-deny to EPERM (not in the kill set, so no
+tripwire kill). abort()/panic=abort still terminates without tgkill (falls through
+to _exit); rayon only reads sched_getaffinity, which stays allowed.
+
+### FNP-002 / FNP-006 (Medium): ambient authority the seccomp filter can't express
+The worker inherited the parent's full environment and every fd above std{in,out,
+err}, and nothing killed an orphaned worker whose parent died mid-run. Fixed:
+`env_clear()` on the worker spawn (no LD_PRELOAD / proxy / locale carried in); a new
+`harden_worker_preinput()` that runs as the worker's FIRST action (before the jail,
+before any input) and closes fds >= 3 in one `close_range`, arms
+`PR_SET_PDEATHSIG=SIGKILL`, and re-checks getppid to bail on the parent-already-died
+race. Fail-closed: any failure aborts before untrusted bytes are read.
+
+### FNP-003 (Medium): stale bundled SQLite (CVE-2025-3277)
+rusqlite 0.31 bundled SQLite 3.45.0, before the 3.49.1 fix for CVE-2025-3277
+(integer overflow in concat_ws). We parse untrusted corpus images with sqlite.
+Fixed: rusqlite 0.31 -> 0.37, bundling SQLite 3.50.2; a build-time test asserts the
+linked version is >= 3.49.1 so a future dep downgrade fails the build. (This closes
+the "SQLite version bump deferred" note from the 0.3.2 record.)
+
+### FNP-004 (Medium): TOCTOU + non-regular file in the input read
+`read_input` stat'd the path then re-opened it to read (a symlink-swap window), and
+a device/fifo (e.g. /dev/zero, len 0 then streams forever) sailed past the size
+check. Fixed: open once, fstat and read through the SAME handle, reject non-regular
+files (is_file()), and bound the read with File::take(MAX_INPUT+1).
+
+### FNP-005 (Medium): weak physical-schema check on the untrusted corpus image
+open_image trusted that `funcs` had the expected shape. A crafted image could
+declare it a virtual/shadow table, or an ordinary table with generated/hidden
+columns or affinity-shifting declared types. Fixed: `verify_funcs_schema` runs after
+deserialize (before any row read) and requires funcs be an ordinary 'table' via
+pragma_table_list, with EXACTLY the 9 expected columns in order, matching declared
+types, and hidden==0 via pragma_table_xinfo. Plus octet_length (byte, not char)
+WHERE guards, a Rust byte recheck, and aggregate row/byte budgets that fail closed.
+
+### FNP-007 (Medium): per-writer full-ELF copy + unbounded sharded footprint
+run_worker deep-copied the whole ELF per worker (input.to_vec()), so the sharded
+path held N copies in the parent at once, and input_len * shard_count was unbounded.
+Fixed: run_worker takes Arc<Vec<u8>>; the writer clones the Arc handle, not the
+bytes. Shard count is trimmed so input_len * shards stays under a 2 GiB aggregate
+budget (never below 1; output is byte-identical at any shard count, so this only
+trades parallelism).
+
+### FNP-008 (Medium): emu region flood + swallowed map errors + overlapping segments
+ensure_pages fell back to one mem_map per page and ignored map errors (`let _ =`),
+and the loader accepted overlapping PT_LOADs, which fragment the map. Fixed: the
+loader rejects byte-overlapping PT_LOAD ranges (sorted by vaddr; page-boundary
+sharing between byte-disjoint segments is still allowed); ensure_pages coalesces
+maximal runs of still-unmapped pages into one mem_map each, propagates real errors
+via `?`, and caps setup runs (MAX_SETUP_RUNS) so a pathological layout fails to a
+capped trace instead of marching toward qemu's region-count abort.
+
+### FNP-009 (Medium): symbol map deep-cloned per run
+The full symbol map was cloned into every Rec (once per force-path per function).
+Fixed: the map is built once and wrapped in Arc before the per-function loop, so the
+per-run clone is a refcount bump. Read-only after construction, shared across the
+rayon workers; identical contents, determinism preserved.
+
+### FNP-010 (Low): CPU rlimit + wall deadline scaled unbounded with cores
+The worker RLIMIT_CPU and the parent's wall deadline both scaled with the machine
+core count, so a bigger box granted a wedged-but-busy worker a proportionally larger
+runaway window (hours on a 128-core server). Fixed: the thread multiplier is clamped
+to 16 in both places, so the backstop is a bounded ceiling regardless of machine
+size; the deadline stays strictly above RLIMIT_CPU (both compute 120*min(threads,16);
+deadline adds +300), so the CPU bound still fires first for legit work. The emu's
+per-function 3s hang guard already bounds per-function time.
+
+### FNP-011 (Low): file paths printed unescaped
+Symbol names were escaped, but file paths in human/error output were not, so a
+crafted filename could smuggle terminal escapes. Fixed: esc() now wraps every path
+in the error and human output (read_input messages, corpus open, match a/b labels,
+the "wrote -> path" line).
+
+## Reviewer verdict (both mandatory reviewers, source-read, per-finding)
+No High/Medium/Low defect in either review. Both independently confirmed: the
+close_range FFI is the only new unsafe in the sandbox lib and is sound (integer
+args, keeps 0/1/2); the pdeathsig race handling is complete; the schema verifier
+cannot be bypassed (single main db, unqualified funcs resolves to the checked
+table, checks run before any row read); read_input closes the TOCTOU; the
+deadline > RLIMIT_CPU ordering holds on all machine sizes; determinism is preserved
+(no HashSet iteration feeds output; segment sort is a no-op for well-formed ELFs).
+
+## Residuals (honest, not defects)
+- close_range needs kernel >= 5.9; on older kernels harden bails, so the worker
+  fails closed (safe). The jail already requires modern seccomp/clone3, so the
+  effective kernel floor did not move in practice. Target (Kali, 7.x) is fine.
+- PR_SET_CHILD_SUBREAPER could let an orphan reparent to a subreaper (ppid != 1)
+  and pass the getppid check, but pdeathsig already fired on the real parent's
+  death, so the worker still dies. fnprint has no subreaper; theoretical.
+- Pointing the tool at a FIFO blocks at File::open before the is_file() reject
+  (open waits for a writer). Pre-existing (old fs::read blocked identically),
+  operator-self-inflicted, not a memory-safety issue.

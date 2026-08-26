@@ -168,6 +168,26 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
         });
     }
 
+    // PT_LOAD segments must occupy disjoint address ranges: the ELF loading model
+    // gives every byte of the address space to at most one PT_LOAD. a crafted file
+    // with truly overlapping ranges is malformed and, downstream, drives the
+    // emulator's per-page remap fallback, which a hostile layout could fragment
+    // into a flood of qemu memory regions. sort by vaddr (also makes segment order
+    // deterministic) and reject any real byte-level overlap. segments that only
+    // share a rounded page boundary have disjoint bytes and are left alone; the
+    // emulator coalesces those.
+    segments.sort_by_key(|s| s.vaddr);
+    for w in segments.windows(2) {
+        let a_end = w[0].vaddr.saturating_add(w[0].bytes.len() as u64);
+        if w[1].vaddr < a_end {
+            bail!(
+                "overlapping PT_LOAD segments at {:#x} and {:#x}, refusing",
+                w[0].vaddr,
+                w[1].vaddr
+            );
+        }
+    }
+
     let is_pie = elf.header.e_type == goblin::elf::header::ET_DYN;
 
     let mut funcs = discover(&elf, bytes)?;
@@ -472,6 +492,53 @@ mod tests {
             r.is_err(),
             "expected the alloc-amplification bomb to be refused"
         );
+    }
+
+    // two PT_LOADs whose vaddr ranges truly overlap: seg1 starts inside seg0.
+    // [0x1000,0x3000) and [0x2000,0x3000). a well-formed ELF never does this.
+    fn craft_elf_overlap() -> Vec<u8> {
+        let phoff = 64usize;
+        let n = 2usize;
+        let mut e = vec![0u8; phoff + n * 56];
+        e[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        e[4] = 2;
+        e[5] = 1;
+        e[6] = 1;
+        let put16 =
+            |e: &mut [u8], off: usize, v: u16| e[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |e: &mut [u8], off: usize, v: u32| e[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |e: &mut [u8], off: usize, v: u64| e[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        put16(&mut e, 16, 2);
+        put16(&mut e, 18, 62);
+        put32(&mut e, 20, 1);
+        put64(&mut e, 32, phoff as u64);
+        put16(&mut e, 52, 64);
+        put16(&mut e, 54, 56);
+        put16(&mut e, 56, n as u16);
+        let vaddrs = [0x1000u64, 0x2000u64];
+        let memszs = [0x2000u64, 0x1000u64];
+        for i in 0..n {
+            let ph = phoff + i * 56;
+            put32(&mut e, ph, 1); // PT_LOAD
+            put32(&mut e, ph + 4, 4); // R
+            put64(&mut e, ph + 8, 0); // p_offset
+            put64(&mut e, ph + 16, vaddrs[i]);
+            put64(&mut e, ph + 32, 16); // small p_filesz
+            put64(&mut e, ph + 40, memszs[i]);
+            put64(&mut e, ph + 48, 0x1000); // p_align
+        }
+        e
+    }
+
+    #[test]
+    fn overlapping_vaddr_segments_refused() {
+        // truly overlapping PT_LOAD ranges are malformed and drive the emulator's
+        // per-page remap fallback; the loader must reject them up front.
+        let elf = craft_elf_overlap();
+        let e = load(&elf).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains("overlapping PT_LOAD"), "got: {e}");
     }
 
     #[test]

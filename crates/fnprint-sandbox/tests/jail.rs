@@ -96,6 +96,60 @@ fn thread_creation_survives_clone3_enosys() {
 }
 
 #[test]
+fn set_affinity_is_denied() {
+    // FNP-001: sched_setaffinity was dropped from the allow set. it takes a target
+    // pid, so an allowed one lets a popped worker pin any same-uid process. must
+    // soft-deny (EPERM), not hard-kill and not succeed.
+    let st = run("affinity");
+    assert_eq!(st.signal(), None, "sched_setaffinity must not hard-kill");
+    assert_eq!(
+        st.code(),
+        Some(0),
+        "sched_setaffinity must be EPERM-denied inside the jail"
+    );
+}
+
+#[test]
+fn sibling_kill_via_tgkill_is_denied() {
+    // FNP-001: tgkill was dropped from the allow set. its tgid/tid are runtime args
+    // BPF can't pin to self, so an allowed tgkill is a cross-process kill. must
+    // soft-deny (EPERM), not hard-kill and not go through.
+    let st = run("tgkill");
+    assert_eq!(st.signal(), None, "tgkill must not hard-kill");
+    assert_eq!(
+        st.code(),
+        Some(0),
+        "tgkill must be EPERM-denied inside the jail"
+    );
+}
+
+#[test]
+fn preinput_closes_inherited_fds() {
+    // FNP-006: harden_worker_preinput closes every inherited fd above std{in,out,
+    // err}. the probe opens one, arms the hardening, and checks it's gone.
+    let st = run("harden_fds");
+    assert_eq!(st.signal(), None, "fd-close probe must not be killed");
+    assert_eq!(
+        st.code(),
+        Some(0),
+        "inherited fd above 2 must be closed by harden_worker_preinput"
+    );
+}
+
+#[test]
+fn preinput_arms_pdeathsig() {
+    // FNP-006: harden_worker_preinput arms PR_SET_PDEATHSIG=SIGKILL so an orphaned
+    // worker dies with its parent. the probe reads it back.
+    let st = run("pdeathsig");
+    assert_eq!(st.signal(), None, "pdeathsig probe must not be killed");
+    assert_eq!(
+        st.code(),
+        Some(0),
+        "harden_worker_preinput must arm pdeathsig to SIGKILL"
+    );
+}
+
+#[test]
 fn clone3_userns_is_enosys() {
     // clone3(CLONE_NEWUSER) must come back ENOSYS (not success, not EPERM). ENOSYS
     // is what shuts off userns creation via clone3 while still letting glibc fall

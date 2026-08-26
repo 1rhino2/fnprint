@@ -7,7 +7,7 @@ use std::ptr::{self, NonNull};
 use anyhow::{anyhow, Result};
 use fnprint_sig::{Fingerprint, SIG_LEN};
 use rusqlite::serialize::OwnedData;
-use rusqlite::{ffi, params, Connection, DatabaseName, OptionalExtension};
+use rusqlite::{ffi, params, Connection, OptionalExtension, MAIN_DB};
 use serde::{Deserialize, Serialize};
 
 // b bands of r rows. b*r must equal SIG_LEN.
@@ -20,7 +20,37 @@ const SIG_BYTES: i64 = (SIG_LEN * 8) as i64;
 // generous upper bound on a text column (binary path, symbol name, source tag).
 // real values are tens of bytes; anything past 1 MiB is a crafted corpus trying
 // to make the reader allocate, and we skip the row instead of materializing it.
+// this is a BYTE cap: the WHERE guards use octet_length (byte count) not length
+// (character count), so a multibyte string can't slip 4x its bytes past it.
 const MAX_TEXT: i64 = 1 << 20;
+// aggregate corpus backstops for the untrusted-image read (all()). a crafted db
+// can hold millions of individually-valid small rows; these bound the total work
+// before we build a Vec the reply cap would reject anyway. a real corpus is far
+// smaller (the 128 MiB postcard reply cap binds effective corpus size well below
+// these), so they only ever trip a bomb. exceeding them fails closed (bail), not
+// truncates, because a silently short corpus would corrupt match results.
+const MAX_ROWS: usize = 2_000_000;
+const MAX_TOTAL_BYTES: u64 = 256 << 20; // 256 MiB of decoded text + sig
+
+// the exact physical shape open_image requires of `funcs` before it reads a row.
+// DEFENSIVE + ENABLE_VIEW=false + TRUSTED_SCHEMA=false already block views and
+// schema-defined SQL surface, but a crafted image can still declare funcs as a
+// virtual/shadow table, or an ordinary table carrying generated/hidden columns
+// whose expressions drag in extra sqlite surface, or columns whose declared type
+// shifts affinity under our WHERE guards. so we assert funcs is an ordinary rowid
+// table with exactly these columns, in this order, with these declared types and
+// no hidden/generated columns. anything else is rejected, never read.
+const EXPECTED_FUNCS_COLS: &[(&str, &str)] = &[
+    ("id", "INTEGER"),
+    ("binary", "TEXT"),
+    ("name", "TEXT"),
+    ("entry", "INTEGER"),
+    ("source", "TEXT"),
+    ("complexity", "INTEGER"),
+    ("shingles", "INTEGER"),
+    ("capped", "INTEGER"),
+    ("sig", "BLOB"),
+];
 
 pub struct Db {
     pub conn: Connection,
@@ -87,8 +117,67 @@ impl Db {
         let data = owned_from_bytes(bytes)?;
         // read_only = true -> SQLITE_DESERIALIZE_READONLY: sqlite refuses writes
         // and never grows/journals the image.
-        conn.deserialize(DatabaseName::Main, data, true)?;
+        conn.deserialize(MAIN_DB, data, true)?;
+        // parse-and-check the physical schema before any row read. this also
+        // forces sqlite to materialize the (lazily-parsed) schema now, so a
+        // malformed schema surfaces here as a clean error, not mid-query.
+        Self::verify_funcs_schema(&conn)?;
         Ok(Db { conn })
+    }
+
+    // assert `funcs` is an ordinary table with exactly the expected columns and
+    // no hidden/generated columns. runs against the untrusted deserialized image,
+    // inside the jail, before all() reads anything.
+    fn verify_funcs_schema(conn: &Connection) -> Result<()> {
+        // funcs must be an ordinary table (not a view/virtual/shadow table).
+        // pragma_table_list.type is 'table' | 'view' | 'virtual' | 'shadow'.
+        let kind: Option<String> = conn
+            .query_row(
+                "SELECT type FROM pragma_table_list WHERE schema='main' AND name='funcs'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match kind.as_deref() {
+            Some("table") => {}
+            Some(other) => {
+                anyhow::bail!("corpus funcs is a '{other}', expected an ordinary table")
+            }
+            None => anyhow::bail!("corpus has no funcs table"),
+        }
+        // exact columns, declared types, and no hidden/generated columns.
+        // pragma_table_xinfo.hidden: 0 normal, 1 hidden (vtab), 2 generated-
+        // virtual, 3 generated-stored. anything != 0 is rejected.
+        let mut st = conn.prepare(
+            "SELECT name, upper(type), hidden FROM pragma_table_xinfo('funcs') ORDER BY cid",
+        )?;
+        let cols: Vec<(String, String, i64)> = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        if cols.len() != EXPECTED_FUNCS_COLS.len() {
+            anyhow::bail!(
+                "corpus funcs has {} columns, expected {}",
+                cols.len(),
+                EXPECTED_FUNCS_COLS.len()
+            );
+        }
+        for ((name, ty, hidden), (exp_name, exp_ty)) in cols.iter().zip(EXPECTED_FUNCS_COLS) {
+            if *hidden != 0 {
+                anyhow::bail!("corpus funcs column '{name}' is hidden/generated (hidden={hidden})");
+            }
+            if name != exp_name || ty != *exp_ty {
+                anyhow::bail!(
+                    "corpus funcs column mismatch: got '{name}' {ty}, expected '{exp_name}' {exp_ty}"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn init(conn: &Connection) -> Result<()> {
@@ -155,15 +244,32 @@ impl Db {
         let mut st = self.conn.prepare(
             "SELECT id,binary,name,entry,source,complexity,shingles,capped,sig
              FROM funcs
-             WHERE length(sig)=?1
-               AND length(binary)<=?2
-               AND (name IS NULL OR length(name)<=?2)
-               AND length(source)<=?2",
+             WHERE octet_length(sig)=?1
+               AND octet_length(binary)<=?2
+               AND (name IS NULL OR octet_length(name)<=?2)
+               AND octet_length(source)<=?2",
         )?;
         let rows = st.query_map(params![SIG_BYTES, MAX_TEXT], |r| Ok(row_to_rec(r)))?;
         let mut out = Vec::new();
+        let mut total_bytes: u64 = 0;
         for r in rows {
-            out.push(r??);
+            let rec = r??;
+            // byte recheck in Rust: the octet_length WHERE already dropped over-
+            // long text, this catches a build whose sqlite octet_length behaves
+            // unexpectedly. skip the crafted row, same as a corrupt-sig row.
+            if over_text_cap(&rec) {
+                continue;
+            }
+            // aggregate bomb backstops: fail closed rather than build a Vec a
+            // billion-row image would blow memory (and the reply cap) on.
+            if out.len() >= MAX_ROWS {
+                anyhow::bail!("corpus exceeds {MAX_ROWS}-row budget");
+            }
+            total_bytes = total_bytes.saturating_add(rec_bytes(&rec));
+            if total_bytes > MAX_TOTAL_BYTES {
+                anyhow::bail!("corpus exceeds {MAX_TOTAL_BYTES}-byte budget");
+            }
+            out.push(rec);
         }
         Ok(out)
     }
@@ -195,10 +301,10 @@ impl Db {
             // tests) consistent with all()'s defense in depth.
             "SELECT id,binary,name,entry,source,complexity,shingles,capped,sig
              FROM funcs
-             WHERE id=?1 AND length(sig)=?2
-               AND length(binary)<=?3
-               AND (name IS NULL OR length(name)<=?3)
-               AND length(source)<=?3",
+             WHERE id=?1 AND octet_length(sig)=?2
+               AND octet_length(binary)<=?3
+               AND (name IS NULL OR octet_length(name)<=?3)
+               AND octet_length(source)<=?3",
         )?;
         let mut out = Vec::new();
         for id in ids {
@@ -309,6 +415,25 @@ impl Corpus for MemCorpus {
     }
 }
 
+// byte length of the text a row will materialize past its fixed sig blob. used
+// for the aggregate byte budget in all().
+fn rec_bytes(rec: &FuncRec) -> u64 {
+    let name = rec.name.as_deref().map(str::len).unwrap_or(0);
+    (SIG_BYTES as u64)
+        .saturating_add(rec.binary.len() as u64)
+        .saturating_add(name as u64)
+        .saturating_add(rec.source.len() as u64)
+}
+
+// true if any single text field exceeds the byte cap. the SQL octet_length guard
+// already drops these; this is the Rust-side backstop against a divergent sqlite.
+fn over_text_cap(rec: &FuncRec) -> bool {
+    let cap = MAX_TEXT as usize;
+    rec.binary.len() > cap
+        || rec.source.len() > cap
+        || rec.name.as_deref().map(str::len).unwrap_or(0) > cap
+}
+
 fn row_to_rec(r: &rusqlite::Row) -> Result<FuncRec> {
     let sig: Vec<u8> = r.get(8)?;
     // a crafted corpus can store negative/huge shingles/complexity; clamp with
@@ -367,6 +492,19 @@ mod tests {
             complexity: 5,
             capped: false,
         }
+    }
+
+    #[test]
+    fn bundled_sqlite_is_past_cve_2025_3277() {
+        // CVE-2025-3277 (integer overflow in concat_ws) is fixed in SQLite 3.49.1.
+        // we parse untrusted corpus images with sqlite, so a dep downgrade that
+        // dropped the bundle below that must fail the build, not ship silently.
+        // version_number is MAJOR*1_000_000 + MINOR*1_000 + PATCH.
+        let v = rusqlite::version_number();
+        assert!(
+            v >= 3_049_001,
+            "bundled sqlite {v} is below 3.49.1; CVE-2025-3277 unpatched"
+        );
     }
 
     #[test]
@@ -431,7 +569,7 @@ mod tests {
     // serialize an in-memory db to a raw image the way the parent reads one off
     // disk, so open_image can be tested without a file.
     fn image_of(db: &Db) -> Vec<u8> {
-        db.conn.serialize(DatabaseName::Main).unwrap().to_vec()
+        db.conn.serialize(MAIN_DB).unwrap().to_vec()
     }
 
     #[test]
@@ -476,6 +614,117 @@ mod tests {
         // empty image too
         let empty = Db::open_image(&[]).and_then(|db| db.all());
         assert!(empty.is_err());
+    }
+
+    // serialize a raw connection (bypassing init()) so a test can craft any
+    // physical schema the way a hostile corpus author would.
+    fn crafted_image(setup_sql: &str) -> Vec<u8> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(setup_sql).unwrap();
+        conn.serialize(MAIN_DB).unwrap().to_vec()
+    }
+
+    #[test]
+    fn rejects_funcs_as_view() {
+        // funcs declared as a VIEW over a base table must be rejected outright:
+        // a view body is arbitrary SQL surface we refuse to run.
+        let img = crafted_image(
+            "CREATE TABLE base(id INTEGER, binary TEXT, name TEXT, entry INTEGER,
+                 source TEXT, complexity INTEGER, shingles INTEGER, capped INTEGER, sig BLOB);
+             CREATE VIEW funcs AS SELECT * FROM base;",
+        );
+        let e = Db::open_image(&img)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            e.contains("view") || e.to_lowercase().contains("funcs"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn rejects_generated_column() {
+        // exactly the 9 expected column names/types, but `capped` is a generated
+        // column (hidden != 0). must be rejected, not read.
+        let img = crafted_image(
+            "CREATE TABLE funcs(
+                 id INTEGER PRIMARY KEY, binary TEXT NOT NULL, name TEXT, entry INTEGER NOT NULL,
+                 source TEXT NOT NULL, complexity INTEGER NOT NULL, shingles INTEGER NOT NULL,
+                 capped INTEGER GENERATED ALWAYS AS (0) VIRTUAL, sig BLOB NOT NULL);",
+        );
+        let e = Db::open_image(&img)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("hidden/generated"), "got: {e}");
+    }
+
+    #[test]
+    fn rejects_extra_column() {
+        // an extra column past the expected 9 changes the physical shape; reject.
+        let img = crafted_image(
+            "CREATE TABLE funcs(
+                 id INTEGER PRIMARY KEY, binary TEXT NOT NULL, name TEXT, entry INTEGER NOT NULL,
+                 source TEXT NOT NULL, complexity INTEGER NOT NULL, shingles INTEGER NOT NULL,
+                 capped INTEGER NOT NULL, sig BLOB NOT NULL, extra INTEGER);",
+        );
+        let e = Db::open_image(&img)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("columns"), "got: {e}");
+    }
+
+    #[test]
+    fn rejects_wrong_column_type() {
+        // sig declared TEXT instead of BLOB shifts affinity under our guards; reject.
+        let img = crafted_image(
+            "CREATE TABLE funcs(
+                 id INTEGER PRIMARY KEY, binary TEXT NOT NULL, name TEXT, entry INTEGER NOT NULL,
+                 source TEXT NOT NULL, complexity INTEGER NOT NULL, shingles INTEGER NOT NULL,
+                 capped INTEGER NOT NULL, sig TEXT NOT NULL);",
+        );
+        let e = Db::open_image(&img)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("column mismatch"), "got: {e}");
+    }
+
+    #[test]
+    fn multibyte_text_over_byte_cap_is_skipped() {
+        // a name whose CHARACTER count is under the cap but whose BYTE count is
+        // over it must be dropped: the guard is octet_length (bytes), not length
+        // (chars). 400k 3-byte chars = 1.2 MiB > MAX_TEXT but only 400k chars.
+        let src = Db::open_memory().unwrap();
+        src.insert("a.bin", Some("good"), 0x1000, "symtab", &fp(0))
+            .unwrap();
+        let wide = "\u{3042}".repeat(400_000); // 'HIRAGANA A', 3 bytes each
+        assert!(
+            (wide.chars().count() as i64) < MAX_TEXT,
+            "char count must be under cap"
+        );
+        assert!(
+            (wide.len() as i64) > MAX_TEXT,
+            "byte count must be over cap"
+        );
+        src.insert("b.bin", Some(&wide), 0x2000, "symtab", &fp(1))
+            .unwrap();
+        let db = Db::open_image(&image_of(&src)).unwrap();
+        let all = db.all().unwrap();
+        assert_eq!(all.len(), 1, "only the byte-sane row should load");
+        assert_eq!(all[0].name.as_deref(), Some("good"));
+    }
+
+    #[test]
+    fn wellformed_image_still_passes_schema_check() {
+        // the schema verifier must accept a corpus our own init() produced.
+        let src = Db::open_memory().unwrap();
+        src.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0))
+            .unwrap();
+        let db = Db::open_image(&image_of(&src)).unwrap();
+        assert_eq!(db.all().unwrap().len(), 1);
     }
 
     #[test]

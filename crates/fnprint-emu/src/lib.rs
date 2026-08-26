@@ -8,6 +8,7 @@
 //! arch-neutral effect stream. That stream is the thing we fingerprint.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use capstone::prelude::*;
 use fnprint_loader::{Func, Image};
@@ -34,6 +35,12 @@ const RET_ADDR: u64 = 0x30_0000_0000;
 /// code plenty of headroom while cutting the worst-case cost ~16x. bench accuracy
 /// is unchanged at this value (verified against NUMBERS.md).
 const MAX_RUNTIME_MAPS: usize = 256;
+/// most coalesced page-runs a single setup ensure_pages call may create in its
+/// overlap fallback. byte-disjoint segments (the loader rejects real overlaps)
+/// split a span into at most a couple of runs at shared boundary pages, so this
+/// is far above legit need; exceeding it means a pathological layout, and we fail
+/// the run closed (capped trace) rather than march toward qemu's region cap.
+const MAX_SETUP_RUNS: usize = 64;
 
 #[derive(Clone)]
 pub struct Config {
@@ -88,7 +95,9 @@ struct Rec {
     seen_reads: HashSet<u64>,
     heapish_count: usize,
     cs: Capstone,
-    symbols: HashMap<u64, String>,
+    // shared, not owned per-run: cloning this into every Rec deep-copied the whole
+    // symbol map once per force-path. an Arc makes the per-run clone a refcount bump.
+    symbols: Arc<HashMap<u64, String>>,
     ret_ctr: u64,
     cfg: Config,
     // ranges of the binary's own loaded segments, for Global classification
@@ -218,7 +227,12 @@ impl MicroExec {
 
     /// a single natural run, no forced branches. used by tests and as the
     /// baseline that path exploration diverges from.
-    pub fn run(&self, image: &Image, func: &Func, symbols: &HashMap<u64, String>) -> EffectTrace {
+    pub fn run(
+        &self,
+        image: &Image,
+        func: &Func,
+        symbols: &Arc<HashMap<u64, String>>,
+    ) -> EffectTrace {
         self.run_forced(image, func, symbols, &[]).0
     }
 
@@ -231,7 +245,7 @@ impl MicroExec {
         &self,
         image: &Image,
         func: &Func,
-        symbols: &HashMap<u64, String>,
+        symbols: &Arc<HashMap<u64, String>>,
         seeds: &[u64],
     ) -> Vec<EffectTrace> {
         let mut out = Vec::new();
@@ -256,7 +270,7 @@ impl MicroExec {
         &self,
         image: &Image,
         func: &Func,
-        symbols: &HashMap<u64, String>,
+        symbols: &Arc<HashMap<u64, String>>,
         force: &[bool],
     ) -> (EffectTrace, Vec<bool>) {
         match self.try_run(image, func, symbols, force) {
@@ -278,7 +292,7 @@ impl MicroExec {
         &self,
         image: &Image,
         func: &Func,
-        symbols: &HashMap<u64, String>,
+        symbols: &Arc<HashMap<u64, String>>,
         force: &[bool],
     ) -> Result<(EffectTrace, Vec<bool>), unicorn_engine::uc_error> {
         let cs = Capstone::new()
@@ -697,14 +711,38 @@ fn ensure_pages(
         }
         return Ok(());
     }
-    // bulk map failed, usually part of the span overlaps an existing region.
-    // fall back to mapping just the still-unmapped pages, one at a time.
+    // bulk map failed: part of the span overlaps an already-mapped region (a
+    // legit shared boundary page between byte-disjoint segments). map just the
+    // still-unmapped pages, but COALESCE maximal runs of them into one mem_map
+    // each so a fragmented span can't explode into one region per page. `mapped`
+    // is our authoritative mirror of what's mapped during setup (nothing else
+    // maps here), so a page absent from it is genuinely free: a run of such
+    // pages must map cleanly, and a failure is a real error we propagate rather
+    // than swallow (swallowing left a page unmapped and faulted mid-run later).
+    let mut runs = 0usize;
     let mut p = first;
     while p < last {
-        if mapped.insert(p) {
-            let _ = uc.mem_map(p, PAGE, Prot::ALL);
+        if mapped.contains(&p) {
+            p += PAGE;
+            continue;
         }
-        p += PAGE;
+        let run_start = p;
+        while p < last && !mapped.contains(&p) {
+            p += PAGE;
+        }
+        runs += 1;
+        // a legit disjoint layout splits a span into at most a couple of runs
+        // (boundary pages only). many runs means a pathological overlap pattern;
+        // fail closed (-> capped trace) before we approach qemu's region cap.
+        if runs > MAX_SETUP_RUNS {
+            return Err(unicorn_engine::uc_error::NOMEM);
+        }
+        uc.mem_map(run_start, p - run_start, Prot::ALL)?;
+        let mut q = run_start;
+        while q < p {
+            mapped.insert(q);
+            q += PAGE;
+        }
     }
     Ok(())
 }
@@ -767,10 +805,51 @@ mod tests {
     }
 
     #[test]
+    fn coalescing_fallback_maps_shared_boundary_page() {
+        // two byte-disjoint segments that share a rounded page: A ends mid-page and
+        // B begins in that same page. B's span overlaps A's already-mapped page, so
+        // ensure_pages takes the coalescing fallback. setup must still complete and
+        // the function must actually run (instret > 0), proving the fallback mapped
+        // the free pages instead of erroring the whole run out.
+        let mut a = vec![0u8; 0xf00];
+        a[0] = 0xc3; // `ret` at the entry 0x401000
+        let image = Image {
+            segments: vec![
+                Segment {
+                    vaddr: 0x401000,
+                    bytes: a,
+                    exec: true,
+                    write: false,
+                },
+                Segment {
+                    vaddr: 0x401f00,
+                    bytes: vec![0u8; 0x200],
+                    exec: false,
+                    write: true,
+                },
+            ],
+            entry: 0x401000,
+            is_pie: false,
+        };
+        let func = Func {
+            name: None,
+            entry: 0x401000,
+            size: 0x10,
+            source: FuncSource::Symtab,
+        };
+        let t = MicroExec::new(Config::default()).run(&image, &func, &Arc::new(HashMap::new()));
+        assert!(
+            t.instret >= 1,
+            "shared-boundary-page setup must map cleanly and run, got instret {}",
+            t.instret
+        );
+    }
+
+    #[test]
     fn writes_arg0_and_returns_it() {
         // mov [rdi], rsi ; mov rax, rdi ; ret
         let code = [0x48, 0x89, 0x37, 0x48, 0x89, 0xf8, 0xc3];
-        let t = MicroExec::new(Config::default()).run(&img(&code), &f(), &HashMap::new());
+        let t = MicroExec::new(Config::default()).run(&img(&code), &f(), &Arc::new(HashMap::new()));
         let has_write = t.effects.iter().any(|e| {
             matches!(
                 e,
@@ -805,7 +884,8 @@ mod tests {
             size: 0x200,
             source: FuncSource::Symtab,
         };
-        let t = MicroExec::new(Config::default()).run(&img(&code), &func, &HashMap::new());
+        let t =
+            MicroExec::new(Config::default()).run(&img(&code), &func, &Arc::new(HashMap::new()));
         assert!(t.coverage < 0.05, "coverage should be tiny: {}", t.coverage);
     }
 
@@ -820,7 +900,8 @@ mod tests {
             size: code.len() as u64,
             source: FuncSource::Symtab,
         };
-        let t = MicroExec::new(Config::default()).run(&img(&code), &func, &HashMap::new());
+        let t =
+            MicroExec::new(Config::default()).run(&img(&code), &func, &Arc::new(HashMap::new()));
         assert!(t.coverage > 0.9, "coverage should be ~full: {}", t.coverage);
     }
 
@@ -849,7 +930,7 @@ mod tests {
         let code = [0xe8, 0xfb, 0x00, 0x00, 0x00, 0xc3];
         let mut syms = HashMap::new();
         syms.insert(0x401100u64, "do_thing".to_string());
-        let t = MicroExec::new(Config::default()).run(&img(&code), &f(), &syms);
+        let t = MicroExec::new(Config::default()).run(&img(&code), &f(), &Arc::new(syms));
         let named = t.effects.iter().any(|e| {
             matches!(e,
             Effect::Call(CallTarget::Sym(n)) if n == "do_thing")
@@ -864,8 +945,8 @@ mod tests {
         // mov rax,[rdi] ; mov [rdi+8],rax ; ret  (chases a pointer, writes back)
         let code = [0x48, 0x8b, 0x07, 0x48, 0x89, 0x47, 0x08, 0xc3];
         let ex = MicroExec::new(Config::default());
-        let a = ex.run(&img(&code), &f(), &HashMap::new());
-        let b = ex.run(&img(&code), &f(), &HashMap::new());
+        let a = ex.run(&img(&code), &f(), &Arc::new(HashMap::new()));
+        let b = ex.run(&img(&code), &f(), &Arc::new(HashMap::new()));
         assert_eq!(a.tokens(), b.tokens());
     }
 
@@ -885,7 +966,7 @@ mod tests {
             max_effects: 32,
             ..Config::default()
         };
-        let t = MicroExec::new(cfg).run(&img(&code), &f(), &HashMap::new());
+        let t = MicroExec::new(cfg).run(&img(&code), &f(), &Arc::new(HashMap::new()));
         assert!(
             t.effects.len() <= 40,
             "effects not capped: {}",
@@ -904,7 +985,7 @@ mod tests {
             max_effects: 32,
             ..Config::default()
         };
-        let t = MicroExec::new(cfg).run(&img(&code), &f(), &HashMap::new());
+        let t = MicroExec::new(cfg).run(&img(&code), &f(), &Arc::new(HashMap::new()));
         assert!(
             t.effects.len() <= 40,
             "rep-store effects not capped: {}",
@@ -925,7 +1006,7 @@ mod tests {
             instr_cap: 10,
             ..Config::default()
         };
-        let t = MicroExec::new(cfg).run(&img(&code), &f(), &HashMap::new());
+        let t = MicroExec::new(cfg).run(&img(&code), &f(), &Arc::new(HashMap::new()));
         assert!(
             t.capped,
             "pure-read rep flood should be capped by the mem-op ceiling"
@@ -936,7 +1017,7 @@ mod tests {
     fn wild_loop_gets_capped_not_hung() {
         // jmp $ (eb fe) -> infinite. visit cap must stop it.
         let code = [0xeb, 0xfe];
-        let t = MicroExec::new(Config::default()).run(&img(&code), &f(), &HashMap::new());
+        let t = MicroExec::new(Config::default()).run(&img(&code), &f(), &Arc::new(HashMap::new()));
         assert!(t.capped, "infinite loop should be capped");
     }
 }

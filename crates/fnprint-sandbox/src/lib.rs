@@ -39,11 +39,20 @@ mod linux {
     // wall budget did not need widening for TCI, only decoupling from core count.
     const CPU_BACKSTOP_WALL_SECS: u64 = 120;
     const GIB: u64 = 1 << 30;
+    // ceiling on the thread multiplier below. emulation is serialized behind a
+    // process-global lock (only the parallel non-emu work - loader, minhash - uses
+    // the rayon pool), so past a point more cores don't buy a legit index more
+    // aggregate CPU, they only widen the runaway window: on a 128-core box an
+    // uncapped 120*threads let a wedged-but-busy worker burn hours of CPU before
+    // RLIMIT_CPU fired. clamp the multiplier so the backstop is a bounded ceiling
+    // regardless of machine size, while machines up to the clamp are unchanged.
+    const CPU_THREAD_CLAMP: u64 = 16;
 
     fn cpu_time_cap() -> u64 {
         let threads = std::thread::available_parallelism()
             .map(|n| n.get() as u64)
-            .unwrap_or(8);
+            .unwrap_or(8)
+            .min(CPU_THREAD_CLAMP);
         CPU_BACKSTOP_WALL_SECS.saturating_mul(threads)
     }
 
@@ -137,8 +146,12 @@ mod linux {
             libc::SYS_rseq,
             libc::SYS_set_tid_address,
             libc::SYS_sched_yield,
+            // getaffinity is read-only (rayon queries the core count); harmless.
+            // sched_setaffinity is deliberately NOT allowed: it takes a target pid
+            // as a runtime arg, so a popped worker could pin ANY same-uid process's
+            // CPU, and nothing in our workload needs to set affinity. it soft-denies
+            // to EPERM. same reasoning drops tgkill below.
             libc::SYS_sched_getaffinity,
-            libc::SYS_sched_setaffinity,
             libc::SYS_getrandom,
             libc::SYS_clock_gettime,
             libc::SYS_clock_nanosleep,
@@ -150,7 +163,12 @@ mod linux {
             libc::SYS_sigaltstack,
             libc::SYS_getpid,
             libc::SYS_gettid,
-            libc::SYS_tgkill, // abort() path
+            // tgkill is NOT allowed: its target tgid/tid are runtime args BPF can't
+            // pin to self, so an allowed tgkill is a cross-process kill primitive (a
+            // popped worker could SIGKILL the trusted parent or any same-uid proc).
+            // glibc's abort()/panic=abort raises SIGABRT via tgkill; with it denied
+            // (EPERM) abort falls through to _exit, so a panicking worker still dies,
+            // just less tidily. worth it to close the cross-process kill.
             libc::SYS_exit,
             libc::SYS_exit_group,
             libc::SYS_restart_syscall,
@@ -434,6 +452,55 @@ mod linux {
         Ok(())
     }
 
+    // close_range(3, MAX, 0) drops every inherited fd from 3 up in one syscall.
+    // the parent wires up only 0/1/2 (stdin payload, stdout reply, stderr drain);
+    // anything above that the worker inherited (a leaked corpus handle, the
+    // parent's epoll/log fd) is ambient authority a popped worker has no reason
+    // to keep. one call, no /proc scan. scoped-unsafe because rustix 0.38 has no
+    // safe close_range wrapper; the call is three integers and touches no memory,
+    // so the unsafe is trivially auditable.
+    #[allow(unsafe_code)]
+    fn close_inherited_fds() -> Result<()> {
+        // SAFETY: close_range is a bare syscall taking three integer args and no
+        // pointer; it closes fds [3, u32::MAX] and cannot corrupt memory. we keep
+        // 0/1/2 (the parent's pipes) and drop everything else.
+        let rc = unsafe { libc::close_range(3, u32::MAX, 0) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("close_range on inherited fds failed: {err}");
+        }
+        Ok(())
+    }
+
+    // worker-lifecycle hardening the seccomp filter can't express. runs before
+    // the jail and before any untrusted byte is read, so a failure here fails
+    // closed (the caller aborts without touching the input):
+    //  1. close inherited fds above std{in,out,err} (see close_inherited_fds).
+    //  2. PR_SET_PDEATHSIG = SIGKILL. the parent reaps the worker on a deadline,
+    //     but pdeathsig closes the window where the parent is killed mid-run and
+    //     the worker keeps grinding hostile bytes as an init-reparented orphan.
+    //  3. re-check getppid after arming pdeathsig. pdeathsig arms against the
+    //     parent that existed at set time; if the parent already exited just
+    //     before we armed it, we've been reparented to init (pid 1) and the
+    //     signal will never fire. detect that (ppid == 1, or no parent) and bail
+    //     rather than run untrusted work with no supervisor.
+    fn harden_worker_preinput() -> Result<()> {
+        use rustix::process::{getppid, set_parent_process_death_signal, Pid, Signal};
+        close_inherited_fds()?;
+        set_parent_process_death_signal(Some(Signal::Kill)).context("set pdeathsig")?;
+        match getppid() {
+            None => anyhow::bail!("refusing to run: worker has no parent process"),
+            Some(ppid) if ppid == Pid::INIT => {
+                anyhow::bail!("refusing to run: parent already exited (reparented to init)")
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    pub fn harden_worker_preinput_pub() -> Result<()> {
+        harden_worker_preinput()
+    }
+
     pub fn lock_down_worker() -> Result<()> {
         // check for W^X while open() still works, before any filter is installed.
         assert_no_wx_mappings()?;
@@ -459,4 +526,19 @@ pub fn lock_down_worker() -> anyhow::Result<()> {
 #[cfg(not(target_os = "linux"))]
 pub fn lock_down_worker() -> anyhow::Result<()> {
     anyhow::bail!("process sandbox is only implemented on linux")
+}
+
+/// Worker-lifecycle hardening that seccomp can't express: close inherited fds
+/// above std{in,out,err}, arm PR_SET_PDEATHSIG=SIGKILL, and bail if the parent
+/// already died (reparented to init). Call this as the worker's first action,
+/// before `lock_down_worker` and before reading any untrusted input, so a
+/// failure fails closed. Returns Err on non-Linux.
+#[cfg(target_os = "linux")]
+pub fn harden_worker_preinput() -> anyhow::Result<()> {
+    linux::harden_worker_preinput_pub()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn harden_worker_preinput() -> anyhow::Result<()> {
+    anyhow::bail!("worker hardening is only implemented on linux")
 }

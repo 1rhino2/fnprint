@@ -42,6 +42,44 @@ struct CloneArgs {
 #[allow(unsafe_code)]
 fn main() {
     let which = std::env::args().nth(1).unwrap_or_default();
+
+    // harden-only cases exercise the pre-jail worker lifecycle (fd close,
+    // pdeathsig) and exit before the seccomp lockdown.
+    match which.as_str() {
+        "harden_fds" => {
+            use std::os::unix::io::IntoRawFd;
+            // open something to land an fd >= 3, hand ownership off as a raw fd so
+            // Drop doesn't close it: harden must be the thing that closes it.
+            let raw = std::fs::File::open("/dev/null")
+                .expect("open /dev/null")
+                .into_raw_fd();
+            if raw < 3 {
+                exit(4); // setup wrong: expected an inherited fd above 2
+            }
+            fnprint_sandbox::harden_worker_preinput().expect("harden");
+            // F_GETFD on a closed fd returns -1 (EBADF).
+            let r = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+            if r == -1 {
+                exit(0); // closed by close_range as intended
+            }
+            exit(3); // still open: close_range missed it
+        }
+        "pdeathsig" => {
+            fnprint_sandbox::harden_worker_preinput().expect("harden");
+            // read PR_GET_PDEATHSIG back; harden must have armed SIGKILL.
+            let mut sig: libc::c_int = 0;
+            let r = unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut sig as *mut libc::c_int) };
+            if r != 0 {
+                exit(4);
+            }
+            if sig == libc::SIGKILL {
+                exit(0);
+            }
+            exit(3); // wrong or unset pdeathsig
+        }
+        _ => {}
+    }
+
     fnprint_sandbox::lock_down_worker().expect("lockdown");
     println!("locked");
     match which.as_str() {
@@ -155,6 +193,41 @@ fn main() {
                 exit(0); // denied exactly as intended
             }
             exit(4); // some other errno (EPERM would break glibc's fallback)
+        }
+        "affinity" => {
+            // sched_setaffinity is no longer in the allow set (FNP-001): it takes a
+            // target pid, so it'd be a cross-process CPU-pin primitive. must EPERM,
+            // not succeed. exit 0 if denied, 3 if allowed (hole), 4 on wrong errno.
+            let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            unsafe { libc::CPU_SET(0, &mut mask) };
+            let r = unsafe {
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mask)
+            };
+            if r == 0 {
+                exit(3);
+            }
+            let err = unsafe { *libc::__errno_location() };
+            if err == libc::EPERM {
+                exit(0);
+            }
+            exit(4);
+        }
+        "tgkill" => {
+            // tgkill is no longer allowed (FNP-001): its target tgid/tid are runtime
+            // args, so it's a cross-process kill primitive. even sig 0 to self must
+            // EPERM now. exit 0 if denied, 3 if it went through (hole), 4 on wrong
+            // errno.
+            let pid = unsafe { libc::getpid() };
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+            let r = unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, 0) };
+            if r == 0 {
+                exit(3);
+            }
+            let err = unsafe { *libc::__errno_location() };
+            if err == libc::EPERM {
+                exit(0);
+            }
+            exit(4);
         }
         _ => {
             // allowed path: a little compute, write already proven by "locked"

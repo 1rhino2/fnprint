@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -33,7 +33,7 @@ capstone = "0.14"
 unicorn-engine = { package = "unicorn-engine-tci", version = "=2.1.5", default-features = false, features = ["arch_x86"] }
 # serialize gives sqlite3_deserialize, used to parse a corpus .db entirely in
 # memory inside the jailed worker (no file open), see fnprint-db::Db::open_image.
-rusqlite = { version = "0.31", features = ["bundled", "serialize"] }
+rusqlite = { version = "0.37", features = ["bundled", "serialize"] }
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -53,11 +53,12 @@ codegen-units = 1
 strip = true
 
 # the workspace is unsafe-forbid everywhere except two crates that set their own
-# [lints] to unsafe_code = "deny" plus a single scoped #[allow]: fnprint-db (one
-# audited sqlite3_malloc FFI shim for deserialize) and fnprint-sandbox (only its
-# jailbreak_probe test binary, which needs raw mmap/mprotect to prove the
-# PROT_EXEC deny; the sandbox library itself is unsafe-free). the only native
-# memory lives inside the unicorn/capstone/sqlite C libs, not our code.
+# [lints] to unsafe_code = "deny" plus scoped #[allow]s: fnprint-db (one audited
+# sqlite3_malloc FFI shim for deserialize) and fnprint-sandbox (one close_range
+# FFI call in harden_worker_preinput to drop inherited fds, and its jailbreak_probe
+# test binary's raw mmap/mprotect that proves the PROT_EXEC deny). every scoped
+# unsafe is a bare libc syscall with integer args and no pointer deref on attacker
+# data; the real native memory lives inside the unicorn/capstone/sqlite C libs.
 # also ban the panic-macro family so no parse path can grow a panic (none today).
 [workspace.lints.rust]
 unsafe_code = "forbid"
