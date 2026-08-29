@@ -786,10 +786,20 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool, fmt: Format) -> 
         .unwrap_or(binary);
 
     let named = funcs.iter().filter(|f| f.name.is_some()).count();
-    let usable = funcs
+    let signal_cov: Vec<f32> = funcs
         .iter()
         .filter(|f| f.fp.complexity >= MIN_COMPLEXITY)
-        .count();
+        .map(|f| f.coverage)
+        .collect();
+    let usable = signal_cov.len();
+    // mean coverage over the prints that carry signal: how much of each function
+    // body the microexecution actually observed. a low mean warns that these
+    // prints rest on little behavior (guard-heavy or heavily-capped functions).
+    let mean_cov = if signal_cov.is_empty() {
+        None
+    } else {
+        Some(signal_cov.iter().sum::<f32>() / signal_cov.len() as f32)
+    };
 
     let mut wrote = None;
     if let Some(path) = out {
@@ -832,13 +842,23 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool, fmt: Format) -> 
         }));
     }
 
-    println!(
-        "{}: {} functions, {} named, {} with enough signal",
-        esc(label),
-        funcs.len(),
-        named,
-        usable
-    );
+    match mean_cov {
+        Some(c) => println!(
+            "{}: {} functions, {} named, {} with enough signal ({:.0}% mean coverage)",
+            esc(label),
+            funcs.len(),
+            named,
+            usable,
+            c * 100.0
+        ),
+        None => println!(
+            "{}: {} functions, {} named, {} with enough signal",
+            esc(label),
+            funcs.len(),
+            named,
+            usable
+        ),
+    }
     if let Some(path) = wrote {
         println!("wrote {} prints -> {}", funcs.len(), esc(path));
     }
