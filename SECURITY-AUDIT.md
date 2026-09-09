@@ -327,3 +327,65 @@ deadline > RLIMIT_CPU ordering holds on all machine sizes; determinism is preser
 - Pointing the tool at a FIFO blocks at File::open before the is_file() reject
   (open waits for a writer). Pre-existing (old fs::read blocked identically),
   operator-self-inflicted, not a memory-safety issue.
+
+# 0.4.3 maintenance (dependency freshness, 2026-09-08)
+
+Routine freshness release, not an emergency. cargo audit was already clean on the
+0.4.2 lockfile, so nothing forced this; the two untrusted-byte parsers were just
+notably behind and got refreshed proactively. Zero source changes: both parser
+bumps compiled against the unchanged loader with no API migration, so this is a
+dependency delta only (6 Cargo.toml + Cargo.lock).
+
+## What changed
+
+- goblin 0.8.2 -> 0.10.7 (parses attacker-controlled ELF headers/symbols/sections)
+- gimli 0.31.1 -> 0.34.0 (parses attacker-controlled .eh_frame FDE ranges)
+- goblin's byte reader: scroll 0.12.0 -> 0.13.0, scroll_derive 0.12.1 -> 0.13.2
+- one new transitive: fnv 1.0.7, pulled by gimli 0.34; indexmap 2.14.0 -> 2.14.2
+- semver-compatible cargo update for the rest (cc, crossbeam-*, smallvec, syn,
+  find-msvc-tools); unicorn-engine-tci stays pinned =2.1.5 (our fork, untouched)
+
+## Verification
+
+- determinism gate (the one that matters for a parser bump): indexed the same ELF
+  at FNPRINT_SHARDS=1 vs =2 and the two DBs are byte-identical. A parser that
+  discovered functions in a nondeterministic order would break this; it holds.
+- 61/61 tests green, including the loader's 9 malformed-ELF cases and the 11 jail
+  tests; fmt + clippy -D warnings clean.
+- cargo audit clean on the refreshed lockfile (112 deps); cargo deny passes (the
+  four stale license-allow warnings are pre-existing and harmless, left alone).
+- end-to-end through the real jail: index (single + sharded), query round-trips
+  5/5 at 100%, stripped .so exercises the gimli eh_frame path, and /dev/zero,
+  random garbage, and a truncated ELF-magic file all degrade to a clean Err with
+  no panic/hang/OOM.
+
+## Review (two mandatory reviewers, source-read, findings verified against source)
+
+Both returned clean, no finding at any severity.
+
+- Parser/determinism reviewer: goblin default is ParseMode::Strict so malformed
+  input returns Err; program/section header parse guards count against buffer size
+  before Vec::with_capacity (no attacker-length OOM); the symtab path is zero-copy;
+  gimli's read path yields FDEs in file order with no HashMap, and the two live
+  unreachable!() in cfi.rs are provably dead behind is_valid_encoding(). fnv never
+  touches fnprint's data path (see below), so determinism is unaffected. The
+  loader's own stable sort-by-entry + dedup also fixes final order independent of
+  parser discovery order.
+- Supply-chain reviewer: no RUSTSEC advisory or yank on the new versions; scroll's
+  unsafe surface actually shrank (10 -> 8 sites, all bounds-guarded byte copies);
+  fnv is the only genuinely new node, is pure-safe (0 unsafe), and is gated behind
+  gimli's write feature (src/write/* only), so it sits outside the untrusted parse
+  (read) path fnprint uses; no build.rs added by any bump; provenance and licenses
+  clean (all permissive, already in the allowlist).
+
+I re-verified the load-bearing claims myself: goblin Strict default (options.rs),
+the OOM guard before with_capacity (program_header.rs:164), fnv confined to
+gimli/src/write and carrying no unsafe and no build.rs. All confirmed.
+
+## Residuals
+
+None new. The 0.4.2 residuals above still stand unchanged (close_range needs
+kernel >= 5.9; theoretical subreaper reparent; FIFO blocks at open). A newer
+parser may discover a slightly different function set on some binary than 0.4.2
+did; that is acceptable because it is deterministic, and old 0.3.x corpora still
+load (the on-disk fingerprint format is unchanged by a parser bump).

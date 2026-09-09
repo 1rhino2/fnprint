@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -20,8 +20,8 @@ repository = "https://github.com/1rhino2/fnprint"
 
 [workspace.dependencies]
 anyhow = "1"
-goblin = "0.8"
-gimli = "0.31"
+goblin = "0.10"
+gimli = "0.34"
 capstone = "0.14"
 # no-JIT (TCI) unicorn fork: builds unicorn from source with the tiny code
 # interpreter (no host codegen -> no executable page needed) and x86-only TCG.
