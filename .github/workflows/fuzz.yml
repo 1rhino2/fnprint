@@ -39,7 +39,10 @@ jobs:
           head -c 64 fuzz/corpus/${{ matrix.target }}/real.so > fuzz/corpus/${{ matrix.target }}/truncated
           printf '\x7fELF\x02\x01\x01' > fuzz/corpus/${{ matrix.target }}/stub
       - name: fuzz ${{ matrix.target }}
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=180 -rss_limit_mb=4096
+        # rust-toolchain.toml pins stable for the normal build, but cargo-fuzz
+        # needs nightly for -Zsanitizer. force nightly here so the inner build
+        # doesn't pick up the stable pin and choke on the -Z flag.
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=180 -rss_limit_mb=4096
       - name: upload crash repro
         if: failure()
         uses: actions/upload-artifact@v4
