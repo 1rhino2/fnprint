@@ -1,6 +1,6 @@
 [package]
 name = "fnprint"
-version = "0.4.3"
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 description = "Behavioral function fingerprinting: name functions in stripped binaries and patch-diff builds by what they do, not their bytes"
@@ -18,11 +18,11 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-fnprint-core = { path = "../crates/fnprint-core", version = "0.4.3" }
-fnprint-db = { path = "../crates/fnprint-db", version = "0.4.3" }
-fnprint-loader = { path = "../crates/fnprint-loader", version = "0.4.3" }
-fnprint-emu = { path = "../crates/fnprint-emu", version = "0.4.3" }
-fnprint-sandbox = { path = "../crates/fnprint-sandbox", version = "0.4.3" }
+fnprint-core = { path = "../crates/fnprint-core", version = "0.5.0" }
+fnprint-db = { path = "../crates/fnprint-db", version = "0.5.0" }
+fnprint-loader = { path = "../crates/fnprint-loader", version = "0.5.0" }
+fnprint-emu = { path = "../crates/fnprint-emu", version = "0.5.0" }
+fnprint-sandbox = { path = "../crates/fnprint-sandbox", version = "0.5.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 postcard = { workspace = true }

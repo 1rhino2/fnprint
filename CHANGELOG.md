@@ -7,6 +7,8 @@ Dates are the tag dates. Older entries are summarized from the release commits.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-14
+
 ### Added
 - `fnprint completions <shell>` prints a shell completion script (bash, zsh,
   fish, powershell, elvish) to stdout.
@@ -119,7 +121,8 @@ First tagged release. Builds on the initial behavioral-fingerprinting engine
 ### Security
 - Sandboxed the emulator, hardened the build.
 
-[Unreleased]: https://github.com/1rhino2/fnprint/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/1rhino2/fnprint/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/1rhino2/fnprint/releases/tag/v0.5.0
 [0.4.3]: https://github.com/1rhino2/fnprint/releases/tag/v0.4.3
 [0.4.2]: https://github.com/1rhino2/fnprint/releases/tag/v0.4.2
 [0.4.1]: https://github.com/1rhino2/fnprint/releases/tag/v0.4.1
