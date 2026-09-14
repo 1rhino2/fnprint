@@ -69,6 +69,16 @@ pub struct FuncRec {
     pub fp: Fingerprint,
 }
 
+/// One print to write, borrowed. The bulk-insert shape for `insert_all`: it holds
+/// references so a caller with a `Vec` of already-indexed functions can hand them
+/// over without cloning the strings or the signature.
+pub struct FuncPrint<'a> {
+    pub name: Option<&'a str>,
+    pub entry: u64,
+    pub source: &'a str,
+    pub fp: &'a Fingerprint,
+}
+
 impl Db {
     pub fn open(path: &str) -> Result<Db> {
         let conn = Connection::open(path)?;
@@ -233,6 +243,28 @@ impl Db {
             )?;
         }
         Ok(id)
+    }
+
+    /// insert every print in `prints` under one transaction. functionally
+    /// identical to calling `insert()` once per print (same rows in funcs +
+    /// bands), but `index -o` on a big binary was paying a commit + fsync per
+    /// statement, so a few hundred functions each meant thousands of tiny
+    /// commits. one BEGIN/COMMIT around the batch turns that into a single
+    /// flush. returns the number of prints written. fail-closed: any error rolls
+    /// the whole batch back when the tx drops without commit, so a half-written
+    /// corpus can't be left behind. must not be called with another transaction
+    /// already open on this connection: it issues its own BEGIN, so a nested call
+    /// errors and writes nothing. the only callers are single-shot parent paths.
+    pub fn insert_all(&self, binary: &str, prints: &[FuncPrint]) -> Result<usize> {
+        // unchecked_transaction borrows &self.conn immutably, same as insert's
+        // execute, so the two shared borrows coexist. it issues BEGIN now and
+        // COMMIT on commit(); a drop without commit rolls back.
+        let tx = self.conn.unchecked_transaction()?;
+        for p in prints {
+            self.insert(binary, p.name, p.entry, p.source, p.fp)?;
+        }
+        tx.commit()?;
+        Ok(prints.len())
     }
 
     pub fn all(&self) -> Result<Vec<FuncRec>> {
@@ -518,6 +550,131 @@ mod tests {
         // querying with foo's own print must surface foo as a candidate
         let cands = db.candidates(&fp(0)).unwrap();
         assert!(cands.iter().any(|c| c.name.as_deref() == Some("foo")));
+    }
+
+    // project a corpus to comparable rows: full content (Fingerprint has no
+    // PartialEq, so compare its fields), sorted by entry for a stable order.
+    type Projected = (
+        String,
+        Option<String>,
+        u64,
+        String,
+        Vec<u64>,
+        u32,
+        u32,
+        bool,
+    );
+    fn project(db: &Db) -> Vec<Projected> {
+        let mut v: Vec<Projected> = db
+            .all()
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.binary,
+                    r.name,
+                    r.entry,
+                    r.source,
+                    r.fp.sig,
+                    r.fp.shingles,
+                    r.fp.complexity,
+                    r.fp.capped,
+                )
+            })
+            .collect();
+        v.sort_by_key(|t| t.2);
+        v
+    }
+    fn band_count(db: &Db) -> i64 {
+        db.conn
+            .query_row("SELECT count(*) FROM bands", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn insert_all_matches_per_row_insert() {
+        // a batch insert must land exactly the rows (funcs + bands) that the same
+        // prints inserted one at a time would, just under one commit.
+        let one = Db::open_memory().unwrap();
+        one.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0))
+            .unwrap();
+        one.insert("a.bin", None, 0x2000, "eh_frame", &fp(7))
+            .unwrap();
+
+        let batch = Db::open_memory().unwrap();
+        let f0 = fp(0);
+        let f7 = fp(7);
+        let n = batch
+            .insert_all(
+                "a.bin",
+                &[
+                    FuncPrint {
+                        name: Some("foo"),
+                        entry: 0x1000,
+                        source: "symtab",
+                        fp: &f0,
+                    },
+                    FuncPrint {
+                        name: None,
+                        entry: 0x2000,
+                        source: "eh_frame",
+                        fp: &f7,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+        // full row content matches, not just the count
+        assert_eq!(project(&batch), project(&one));
+        // and the LSH band rows match too (candidate lookup depends on them)
+        assert_eq!(band_count(&batch), band_count(&one));
+        let cands = batch.candidates(&fp(0)).unwrap();
+        assert!(cands.iter().any(|c| c.name.as_deref() == Some("foo")));
+    }
+
+    #[test]
+    fn insert_all_empty_is_a_noop() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(db.insert_all("a.bin", &[]).unwrap(), 0);
+        assert!(db.all().unwrap().is_empty());
+        assert_eq!(band_count(&db), 0);
+    }
+
+    #[test]
+    fn insert_all_rolls_back_on_error() {
+        // the whole point of the transaction: a mid-batch failure must leave the
+        // corpus empty, not half-written. a unique index on entry makes the second
+        // row (same entry) violate a constraint, so the first row + its bands must
+        // roll back with it.
+        let db = Db::open_memory().unwrap();
+        db.conn
+            .execute_batch("CREATE UNIQUE INDEX ux_entry ON funcs(entry)")
+            .unwrap();
+        let f0 = fp(0);
+        let f1 = fp(1);
+        let res = db.insert_all(
+            "a.bin",
+            &[
+                FuncPrint {
+                    name: Some("first"),
+                    entry: 0x1000,
+                    source: "symtab",
+                    fp: &f0,
+                },
+                FuncPrint {
+                    name: Some("dup"),
+                    entry: 0x1000, // same entry -> UNIQUE violation on row 2
+                    source: "symtab",
+                    fp: &f1,
+                },
+            ],
+        );
+        assert!(res.is_err(), "duplicate entry must fail the batch");
+        assert!(
+            db.all().unwrap().is_empty(),
+            "a failed batch must roll back the rows already inserted"
+        );
+        assert_eq!(band_count(&db), 0, "band rows must roll back too");
     }
 
     #[test]

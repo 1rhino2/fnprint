@@ -36,6 +36,9 @@ unicorn-engine = { package = "unicorn-engine-tci", version = "=2.1.5", default-f
 rusqlite = { version = "0.37", features = ["bundled", "serialize"] }
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
+# completion-script generation for `fnprint completions <shell>`. clap-team crate,
+# shares clap's dependency tree (no new transitive crates beyond clap itself).
+clap_complete = "4"
 serde = { version = "1", features = ["derive"] }
 # output-only: we serialize result structs to json, never parse untrusted json.
 serde_json = "1"

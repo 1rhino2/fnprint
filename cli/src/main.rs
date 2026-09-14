@@ -6,12 +6,12 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use fnprint_core::{
     dump_traces, eval, index_bytes, index_bytes_shard, match_by_name, query_corpus, source_str,
     triage, warm_pool, EffectTrace, IndexedFunc, Verdict, MIN_COMPLEXITY,
 };
-use fnprint_db::{Db, FuncRec, MemCorpus};
+use fnprint_db::{Db, FuncPrint, FuncRec, MemCorpus};
 use fnprint_emu::Config;
 use fnprint_loader::FuncSource;
 use serde::{Deserialize, Serialize};
@@ -112,7 +112,16 @@ enum WorkerReply {
 #[command(
     name = "fnprint",
     version,
-    about = "behavioral function fingerprinting"
+    about = "behavioral function fingerprinting",
+    after_help = "\
+examples:
+  fnprint index libz.so -o corpus.db          fingerprint a build you have symbols for
+  fnprint query mystery.so --corpus corpus.db  name unknown functions from that corpus
+  fnprint match old.so new.so                  show which shared functions changed behavior
+  fnprint triage t.so --vuln v.db --patched p.db   rank a build against vuln vs patched
+  fnprint query t.so --corpus c.db --format json   machine-readable output for scripts
+  fnprint completions bash > /etc/bash_completion.d/fnprint   install shell completion
+"
 )]
 struct Cli {
     /// run the emulator in-process without the sandbox. unsafe: only for a
@@ -148,7 +157,13 @@ enum Cmd {
         out: Option<String>,
     },
     /// diff two binaries (or dbs) by behavior, the n-day view
-    Match { a: String, b: String },
+    Match {
+        a: String,
+        b: String,
+        /// max changed rows to print (0 = all). json output is never capped.
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+    },
     /// name unknown functions in a binary using a corpus db
     Query {
         target: String,
@@ -156,6 +171,9 @@ enum Cmd {
         corpus: String,
         #[arg(long, default_value_t = 0.7)]
         threshold: f64,
+        /// max named rows to print (0 = all). json/r2 output is never capped.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
     },
     /// accuracy metrics between two builds, using symbol names as ground truth
     Eval { a: String, b: String },
@@ -172,9 +190,18 @@ enum Cmd {
         /// how far the two sides must separate before we commit to a verdict
         #[arg(long, default_value_t = 0.08)]
         margin: f64,
+        /// max review-queue rows to print (0 = all). json/r2 output is never capped.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
     },
     /// print the recorded effect trace for one function (debugging)
     Dump { binary: String, func: String },
+    /// print a shell completion script to stdout (bash, zsh, fish, ...)
+    Completions {
+        /// which shell to generate the completion script for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 fn main() -> Result<()> {
@@ -195,12 +222,13 @@ fn main() -> Result<()> {
     let fmt = cli.format;
     match cli.cmd {
         Cmd::Index { binary, out } => cmd_index(&binary, out.as_deref(), ns, fmt),
-        Cmd::Match { a, b } => cmd_match(&a, &b, ns, fmt),
+        Cmd::Match { a, b, limit } => cmd_match(&a, &b, limit, ns, fmt),
         Cmd::Query {
             target,
             corpus,
             threshold,
-        } => cmd_query(&target, &corpus, threshold, ns, fmt),
+            limit,
+        } => cmd_query(&target, &corpus, threshold, limit, ns, fmt),
         Cmd::Eval { a, b } => cmd_eval(&a, &b, ns, fmt),
         Cmd::Triage {
             target,
@@ -208,8 +236,29 @@ fn main() -> Result<()> {
             patched,
             min_sim,
             margin,
-        } => cmd_triage(&target, &vuln, &patched, min_sim, margin, ns, fmt),
+            limit,
+        } => cmd_triage(&target, &vuln, &patched, min_sim, margin, limit, ns, fmt),
         Cmd::Dump { binary, func } => cmd_dump(&binary, &func, ns, fmt),
+        // completions don't touch the emulator or a binary, so the sandbox and
+        // format flags don't apply; just render the script.
+        Cmd::Completions { shell } => cmd_completions(shell),
+    }
+}
+
+// write a shell completion script for `fnprint` to stdout. the operator pipes it
+// to the right place for their shell (see `--help` examples).
+fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
+    let mut cmd = Cli::command();
+    // generate into a buffer (infallible) rather than straight to stdout: the
+    // clap_complete writers unwrap on a write error, so `fnprint completions bash
+    // | head` (closed pipe) would abort under panic=abort. we own the stdout write
+    // and swallow a broken pipe cleanly.
+    let mut buf = Vec::new();
+    clap_complete::generate(shell, &mut cmd, "fnprint", &mut buf);
+    match std::io::stdout().write_all(&buf) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e).context("writing completion script"),
     }
 }
 
@@ -629,6 +678,16 @@ fn is_db(p: &str) -> bool {
     Path::new(p).extension().map(|e| e == "db").unwrap_or(false)
 }
 
+// --limit of 0 means no cap. only the human tables honor it: json/r2 always emit
+// the full set so a script or a plugin never silently loses rows to a display cap.
+fn row_cap(limit: usize) -> usize {
+    if limit == 0 {
+        usize::MAX
+    } else {
+        limit
+    }
+}
+
 // symbol names and labels come out of attacker-controlled ELF strings. anything
 // that isn't a plain printable ascii char gets escaped so a crafted name can't
 // smuggle terminal escape sequences (colors, cursor moves, title sets) into our
@@ -804,15 +863,17 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool, fmt: Format) -> 
     let mut wrote = None;
     if let Some(path) = out {
         let db = Db::open(path)?;
-        for f in &funcs {
-            db.insert(
-                label,
-                f.name.as_deref(),
-                f.entry,
-                source_str(f.source),
-                &f.fp,
-            )?;
-        }
+        // one transaction for the whole binary, not a commit per function
+        let prints: Vec<FuncPrint> = funcs
+            .iter()
+            .map(|f| FuncPrint {
+                name: f.name.as_deref(),
+                entry: f.entry,
+                source: source_str(f.source),
+                fp: &f.fp,
+            })
+            .collect();
+        db.insert_all(label, &prints)?;
         wrote = Some(path);
     }
 
@@ -865,7 +926,7 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool, fmt: Format) -> 
     Ok(())
 }
 
-fn cmd_match(a: &str, b: &str, no_sandbox: bool, fmt: Format) -> Result<()> {
+fn cmd_match(a: &str, b: &str, limit: usize, no_sandbox: bool, fmt: Format) -> Result<()> {
     if fmt == Format::R2 {
         bail!("r2 output is only supported for query and triage");
     }
@@ -899,8 +960,15 @@ fn cmd_match(a: &str, b: &str, no_sandbox: bool, fmt: Format) -> Result<()> {
 
     if !rep.changed.is_empty() {
         println!("\nchanged behavior (lowest similarity first):");
-        for c in rep.changed.iter().take(40) {
+        for c in rep.changed.iter().take(row_cap(limit)) {
             println!("  {:>5.1}%  {}", c.similarity * 100.0, esc(&c.name));
+        }
+        let shown = rep.changed.len().min(row_cap(limit));
+        if shown < rep.changed.len() {
+            println!(
+                "  ... {} more (raise --limit or --limit 0 for all)",
+                rep.changed.len() - shown
+            );
         }
     }
     Ok(())
@@ -910,6 +978,7 @@ fn cmd_query(
     target: &str,
     corpus: &str,
     threshold: f64,
+    limit: usize,
     no_sandbox: bool,
     fmt: Format,
 ) -> Result<()> {
@@ -958,13 +1027,20 @@ fn cmd_query(
         return Ok(());
     }
     println!("named {} function(s):", named.len());
-    for n in &named {
+    for n in named.iter().take(row_cap(limit)) {
         println!(
             "  {:#010x}  {:>5.1}%  {}  ({})",
             n.entry,
             n.similarity * 100.0,
             esc(&n.guess),
             esc(&n.from_binary)
+        );
+    }
+    let shown = named.len().min(row_cap(limit));
+    if shown < named.len() {
+        println!(
+            "  ... {} more (raise --limit or --limit 0 for all)",
+            named.len() - shown
         );
     }
     Ok(())
@@ -1016,12 +1092,17 @@ fn cmd_eval(a: &str, b: &str, no_sandbox: bool, fmt: Format) -> Result<()> {
     Ok(())
 }
 
+// a cli dispatch fn: target + two corpora + two thresholds + limit + the two
+// global flags. bundling them into a struct would just move the noise, so allow
+// the arg count here rather than invent a one-use options type.
+#[allow(clippy::too_many_arguments)]
 fn cmd_triage(
     target: &str,
     vuln: &str,
     patched: &str,
     min_sim: f64,
     margin: f64,
+    limit: usize,
     no_sandbox: bool,
     fmt: Format,
 ) -> Result<()> {
@@ -1095,7 +1176,8 @@ fn cmd_triage(
     // the review queue: strongest vulnerable lead first
     println!("\nreview queue (vuln-leaning, strongest first):");
     println!("   addr         vuln%  patched%  margin  cov   matches");
-    for h in vulns {
+    let total_vulns = vulns.len();
+    for h in vulns.iter().take(row_cap(limit)) {
         // advisory: flag a lead built from little observed behavior so it gets a
         // second look. not a filter, the lead still shows.
         let cov_flag = if h.coverage <= fnprint_core::LOW_COVERAGE_ADVISORY {
@@ -1113,6 +1195,13 @@ fn cmd_triage(
             cov_flag,
             esc(&h.vuln_name),
             esc(&h.patched_name),
+        );
+    }
+    let shown = total_vulns.min(row_cap(limit));
+    if shown < total_vulns {
+        println!(
+            "   ... {} more (raise --limit or --limit 0 for all)",
+            total_vulns - shown
         );
     }
     println!("\ncov = fraction of the target function body microexecution observed.");
@@ -1193,6 +1282,35 @@ mod tests {
         let got = super::read_input(p.to_str().unwrap());
         let _ = std::fs::remove_file(&p);
         assert_eq!(got.unwrap(), b"\x7fELFhello");
+    }
+
+    #[test]
+    fn clap_command_is_valid() {
+        use clap::CommandFactory;
+        // catches a malformed clap derive (duplicate arg, bad default) at test time
+        // instead of only at first run. also exercises the CommandFactory path the
+        // completions generator relies on.
+        super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completions_generate_for_every_shell() {
+        use clap::CommandFactory;
+        use clap_complete::Shell;
+        // generating a script for each supported shell must produce non-empty
+        // output and never panic.
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let mut cmd = super::Cli::command();
+            let mut out = Vec::new();
+            clap_complete::generate(shell, &mut cmd, "fnprint", &mut out);
+            assert!(!out.is_empty(), "empty completion script for {shell:?}");
+        }
     }
 
     #[test]

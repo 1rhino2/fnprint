@@ -124,10 +124,18 @@ fnprint query <target> --corpus <db>    name unknown functions from a corpus
 fnprint triage <t> --vuln <db> --patched <db>   rank a build against vuln vs patched corpora
 fnprint eval <a> <b>                     accuracy metrics using symbol names as truth
 fnprint dump <binary> <func>            print the recorded effect trace (debugging)
+fnprint completions <shell>             print a shell completion script to stdout
 ```
 
 `match` and `query` take either an ELF or a `.db` you built with `index`, so you
 can fingerprint a corpus once and reuse it.
+
+`match`, `query`, and `triage` take `--limit N` to cap how many rows the human
+tables print (0 = all). `json` and `r2` output are never capped, so scripts get
+everything.
+
+`completions` writes a script for `bash`, `zsh`, `fish`, `powershell`, or
+`elvish`, e.g. `fnprint completions bash > /etc/bash_completion.d/fnprint`.
 
 ## machine output
 
@@ -216,6 +224,21 @@ architecture-neutral, which is the groundwork for matching across CPUs.
 - pe and mach-o loaders.
 - rizin/radare2 export ships now (`--format r2`); a real ghidra plugin is next.
   there's an experimental jython import stub in `contrib/` in the meantime.
+
+## development
+
+there's a `Makefile` with the common tasks. `make ci` runs the same gate as the
+build-test CI job (fmt check, clippy, tests) before you push.
+
+```
+make build      # release binary
+make test       # cargo test --all
+make ci         # fmt-check + clippy -D warnings + test
+make deny       # cargo deny (advisories, bans, licenses, sources)
+make bench      # accuracy numbers (needs gcc/clang + zlib source)
+```
+
+release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## license
 

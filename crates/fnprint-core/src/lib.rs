@@ -158,16 +158,17 @@ pub fn index_bytes_shard(
 
 pub fn index_to_db(bytes: &[u8], binary: &str, db: &Db, cfg: Config) -> Result<usize> {
     let funcs = index_bytes(bytes, cfg)?;
-    for f in &funcs {
-        db.insert(
-            binary,
-            f.name.as_deref(),
-            f.entry,
-            source_str(f.source),
-            &f.fp,
-        )?;
-    }
-    Ok(funcs.len())
+    let prints: Vec<fnprint_db::FuncPrint> = funcs
+        .iter()
+        .map(|f| fnprint_db::FuncPrint {
+            name: f.name.as_deref(),
+            entry: f.entry,
+            source: source_str(f.source),
+            fp: &f.fp,
+        })
+        .collect();
+    // one transaction instead of a commit per print, see Db::insert_all
+    db.insert_all(binary, &prints)
 }
 
 // -------- match (n-day / cross-version diff) --------

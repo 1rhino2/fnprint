@@ -55,7 +55,8 @@ each worker reloads the whole ELF and runs its own interpreter (TCI) VM, so on
 typical binaries the per-worker load plus cache contention across many VMs cancels
 the parallelism (measured neutral on small binaries, slower on a mid-size lib). It
 only pays off on large, function-rich corpora, so the default stays single-process
-and byte-identical to older releases.
+and produces the same corpus content as older releases (the rows and bands are
+identical; the SQLite file header can differ, e.g. its change counter).
 
     FNPRINT_SHARDS=8 fnprint index big-corpus.so -o corpus.db
 
