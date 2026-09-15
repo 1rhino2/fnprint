@@ -7,6 +7,14 @@ Dates are the tag dates. Older entries are summarized from the release commits.
 
 ## [Unreleased]
 
+### Fixed
+- Piping human or json output into a reader that closes early (`fnprint query
+  ... | head`) now exits 0 quietly. It used to abort with a panic banner because
+  `println!` panics on a broken pipe and release builds are `panic = "abort"`.
+  0.5.0 had guarded only `completions`.
+- `--help` examples column is aligned, and the completion example installs
+  per-user instead of into `/etc`.
+
 ## [0.5.0] - 2026-09-14
 
 ### Added

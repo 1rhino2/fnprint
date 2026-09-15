@@ -17,6 +17,40 @@ use fnprint_loader::FuncSource;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+// stdout is often a pipe that goes away early (`fnprint query ... | head`).
+// println! panics on EPIPE and the release profile is panic=abort, so that idiom
+// used to die with SIGABRT and a panic banner. every parent-side line goes
+// through outln! instead: a broken pipe turns into this marker error, which
+// main() maps to a quiet exit 0 the way head expects; any other write error is a
+// real one and surfaces as usual. the worker never uses this, its reply goes out
+// via emit() and a broken pipe there is a real failure.
+#[derive(Debug)]
+struct StdoutClosed;
+
+impl std::fmt::Display for StdoutClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout closed")
+    }
+}
+
+impl std::error::Error for StdoutClosed {}
+
+fn stdout_result(r: std::io::Result<()>) -> Result<()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Err(StdoutClosed.into()),
+        Err(e) => Err(e).context("writing to stdout"),
+    }
+}
+
+// println! that returns instead of panicking. only valid inside a fn returning
+// anyhow::Result, same as every cmd_* here.
+macro_rules! outln {
+    ($($t:tt)*) => {
+        stdout_result(writeln!(std::io::stdout(), $($t)*))?
+    };
+}
+
 // hard caps on the privsep pipe so neither side can be pushed into an unbounded
 // alloc. an ELF bigger than this we refuse; a worker reply bigger than this we
 // treat as a compromised worker.
@@ -115,12 +149,13 @@ enum WorkerReply {
     about = "behavioral function fingerprinting",
     after_help = "\
 examples:
-  fnprint index libz.so -o corpus.db          fingerprint a build you have symbols for
-  fnprint query mystery.so --corpus corpus.db  name unknown functions from that corpus
-  fnprint match old.so new.so                  show which shared functions changed behavior
+  fnprint index libz.so -o corpus.db               fingerprint a build you have symbols for
+  fnprint query mystery.so --corpus corpus.db      name unknown functions from that corpus
+  fnprint match old.so new.so                      show which shared functions changed behavior
   fnprint triage t.so --vuln v.db --patched p.db   rank a build against vuln vs patched
   fnprint query t.so --corpus c.db --format json   machine-readable output for scripts
-  fnprint completions bash > /etc/bash_completion.d/fnprint   install shell completion
+  fnprint completions bash > ~/.local/share/bash-completion/completions/fnprint
+                                                   install shell completion for your user
 "
 )]
 struct Cli {
@@ -220,7 +255,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let ns = cli.no_sandbox;
     let fmt = cli.format;
-    match cli.cmd {
+    let res = match cli.cmd {
         Cmd::Index { binary, out } => cmd_index(&binary, out.as_deref(), ns, fmt),
         Cmd::Match { a, b, limit } => cmd_match(&a, &b, limit, ns, fmt),
         Cmd::Query {
@@ -242,6 +277,11 @@ fn main() -> Result<()> {
         // completions don't touch the emulator or a binary, so the sandbox and
         // format flags don't apply; just render the script.
         Cmd::Completions { shell } => cmd_completions(shell),
+    };
+    // the reader hung up mid-table (`| head`): nothing to report, exit clean
+    match res {
+        Err(e) if e.is::<StdoutClosed>() => Ok(()),
+        r => r,
     }
 }
 
@@ -252,14 +292,10 @@ fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
     // generate into a buffer (infallible) rather than straight to stdout: the
     // clap_complete writers unwrap on a write error, so `fnprint completions bash
     // | head` (closed pipe) would abort under panic=abort. we own the stdout write
-    // and swallow a broken pipe cleanly.
+    // and route it through the same broken-pipe handling as the tables.
     let mut buf = Vec::new();
     clap_complete::generate(shell, &mut cmd, "fnprint", &mut buf);
-    match std::io::stdout().write_all(&buf) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        Err(e) => Err(e).context("writing completion script"),
-    }
+    stdout_result(std::io::stdout().write_all(&buf))
 }
 
 // ---- jailed worker ----------------------------------------------------------
@@ -725,7 +761,7 @@ fn r2_ident(s: &str) -> String {
 
 // print a serde_json value as one line and return Ok, the json output path.
 fn emit_json(v: &serde_json::Value) -> Result<()> {
-    println!("{}", serde_json::to_string(v)?);
+    outln!("{}", serde_json::to_string(v)?);
     Ok(())
 }
 
@@ -904,7 +940,7 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool, fmt: Format) -> 
     }
 
     match mean_cov {
-        Some(c) => println!(
+        Some(c) => outln!(
             "{}: {} functions, {} named, {} with enough signal ({:.0}% mean coverage)",
             esc(label),
             funcs.len(),
@@ -912,7 +948,7 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool, fmt: Format) -> 
             usable,
             c * 100.0
         ),
-        None => println!(
+        None => outln!(
             "{}: {} functions, {} named, {} with enough signal",
             esc(label),
             funcs.len(),
@@ -921,7 +957,7 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool, fmt: Format) -> 
         ),
     }
     if let Some(path) = wrote {
-        println!("wrote {} prints -> {}", funcs.len(), esc(path));
+        outln!("wrote {} prints -> {}", funcs.len(), esc(path));
     }
     Ok(())
 }
@@ -951,21 +987,21 @@ fn cmd_match(a: &str, b: &str, limit: usize, no_sandbox: bool, fmt: Format) -> R
         }));
     }
 
-    println!("compared {} functions present in both", rep.compared);
-    println!("  unchanged:  {}", rep.same);
-    println!("  changed:    {}", rep.changed.len());
-    println!("  low-signal: {} (too small to judge)", rep.low_signal);
-    println!("  only in {}: {}", esc(a), rep.only_a.len());
-    println!("  only in {}: {}", esc(b), rep.only_b.len());
+    outln!("compared {} functions present in both", rep.compared);
+    outln!("  unchanged:  {}", rep.same);
+    outln!("  changed:    {}", rep.changed.len());
+    outln!("  low-signal: {} (too small to judge)", rep.low_signal);
+    outln!("  only in {}: {}", esc(a), rep.only_a.len());
+    outln!("  only in {}: {}", esc(b), rep.only_b.len());
 
     if !rep.changed.is_empty() {
-        println!("\nchanged behavior (lowest similarity first):");
+        outln!("\nchanged behavior (lowest similarity first):");
         for c in rep.changed.iter().take(row_cap(limit)) {
-            println!("  {:>5.1}%  {}", c.similarity * 100.0, esc(&c.name));
+            outln!("  {:>5.1}%  {}", c.similarity * 100.0, esc(&c.name));
         }
         let shown = rep.changed.len().min(row_cap(limit));
         if shown < rep.changed.len() {
-            println!(
+            outln!(
                 "  ... {} more (raise --limit or --limit 0 for all)",
                 rep.changed.len() - shown
             );
@@ -1008,27 +1044,27 @@ fn cmd_query(
     if fmt == Format::R2 {
         // a rizin script: run with `. fnprint.r2` inside r2/rizin on the target.
         // names go through r2_ident so a crafted symbol can't inject commands.
-        println!(
+        outln!(
             "# fnprint: {} function(s) named at >= {:.0}%",
             named.len(),
             threshold * 100.0
         );
         for n in &named {
-            println!("afn {} {:#x}", r2_ident(&n.guess), n.entry);
+            outln!("afn {} {:#x}", r2_ident(&n.guess), n.entry);
         }
         return Ok(());
     }
 
     if named.is_empty() {
-        println!(
+        outln!(
             "no matches above {:.0}% (try a lower --threshold)",
             threshold * 100.0
         );
         return Ok(());
     }
-    println!("named {} function(s):", named.len());
+    outln!("named {} function(s):", named.len());
     for n in named.iter().take(row_cap(limit)) {
-        println!(
+        outln!(
             "  {:#010x}  {:>5.1}%  {}  ({})",
             n.entry,
             n.similarity * 100.0,
@@ -1038,7 +1074,7 @@ fn cmd_query(
     }
     let shown = named.len().min(row_cap(limit));
     if shown < named.len() {
-        println!(
+        outln!(
             "  ... {} more (raise --limit or --limit 0 for all)",
             named.len() - shown
         );
@@ -1071,19 +1107,19 @@ fn cmd_eval(a: &str, b: &str, no_sandbox: bool, fmt: Format) -> Result<()> {
         }));
     }
 
-    println!("scored {} functions (had signal + a twin in B)", r.scored);
-    println!("  rank-1 accuracy: {:.1}%", r.rank1_acc() * 100.0);
-    println!("  recall@3:        {:.1}%", r.recall_at(3) * 100.0);
-    println!("  recall@5:        {:.1}%", r.recall_at(5) * 100.0);
-    println!("  MRR:             {:.3}", r.mrr());
-    println!(
+    outln!("scored {} functions (had signal + a twin in B)", r.scored);
+    outln!("  rank-1 accuracy: {:.1}%", r.rank1_acc() * 100.0);
+    outln!("  recall@3:        {:.1}%", r.recall_at(3) * 100.0);
+    outln!("  recall@5:        {:.1}%", r.recall_at(5) * 100.0);
+    outln!("  MRR:             {:.3}", r.mrr());
+    outln!(
         "  precision@same:  {:.1}%  ({} tp / {} fp)",
         r.precision() * 100.0,
         r.tp,
         r.fp
     );
-    println!("  recall@same:     {:.1}%", r.recall() * 100.0);
-    println!(
+    outln!("  recall@same:     {:.1}%", r.recall() * 100.0);
+    outln!(
         "  abstained:       {:.1}%  ({} of {} below same-threshold)",
         r.abstain_rate() * 100.0,
         r.abstained,
@@ -1150,14 +1186,14 @@ fn cmd_triage(
 
     if fmt == Format::R2 {
         // name the vuln-leaning targets in rizin so the analyst opens them first.
-        println!("# fnprint triage: {} vuln-leaning function(s)", vulns.len());
+        outln!("# fnprint triage: {} vuln-leaning function(s)", vulns.len());
         for h in &vulns {
-            println!("afn {} {:#x}", r2_ident(&h.vuln_name), h.entry);
+            outln!("afn {} {:#x}", r2_ident(&h.vuln_name), h.entry);
         }
         return Ok(());
     }
 
-    println!(
+    outln!(
         "{} functions triaged: {} look vulnerable, {} patched, {} inconclusive",
         hits.len(),
         vulns.len(),
@@ -1170,12 +1206,12 @@ fn cmd_triage(
     );
 
     if vulns.is_empty() {
-        println!("\nno function leans vulnerable above the margin. nothing to review.");
+        outln!("\nno function leans vulnerable above the margin. nothing to review.");
         return Ok(());
     }
     // the review queue: strongest vulnerable lead first
-    println!("\nreview queue (vuln-leaning, strongest first):");
-    println!("   addr         vuln%  patched%  margin  cov   matches");
+    outln!("\nreview queue (vuln-leaning, strongest first):");
+    outln!("   addr         vuln%  patched%  margin  cov   matches");
     let total_vulns = vulns.len();
     for h in vulns.iter().take(row_cap(limit)) {
         // advisory: flag a lead built from little observed behavior so it gets a
@@ -1185,7 +1221,7 @@ fn cmd_triage(
         } else {
             " "
         };
-        println!(
+        outln!(
             "   {:#010x}  {:>5.1}   {:>6.1}   {:>+5.1}  {:>3.0}%{} {} vs {}",
             h.entry,
             h.vuln_sim * 100.0,
@@ -1199,13 +1235,13 @@ fn cmd_triage(
     }
     let shown = total_vulns.min(row_cap(limit));
     if shown < total_vulns {
-        println!(
+        outln!(
             "   ... {} more (raise --limit or --limit 0 for all)",
             total_vulns - shown
         );
     }
-    println!("\ncov = fraction of the target function body microexecution observed.");
-    println!(
+    outln!("\ncov = fraction of the target function body microexecution observed.");
+    outln!(
         "a low cov (flagged !) means the verdict rests on little behavior; give it a second look."
     );
     Ok(())
@@ -1225,7 +1261,7 @@ fn cmd_dump(binary: &str, func: &str, no_sandbox: bool, fmt: Format) -> Result<(
         }));
     }
     for line in &lines {
-        println!("{}", esc(line));
+        outln!("{}", esc(line));
     }
     Ok(())
 }
@@ -1282,6 +1318,20 @@ mod tests {
         let got = super::read_input(p.to_str().unwrap());
         let _ = std::fs::remove_file(&p);
         assert_eq!(got.unwrap(), b"\x7fELFhello");
+    }
+
+    #[test]
+    fn stdout_result_maps_broken_pipe_to_quiet_marker() {
+        use std::io::{Error, ErrorKind};
+        assert!(super::stdout_result(Ok(())).is_ok());
+        // EPIPE is the marker main() swallows into exit 0
+        let closed = super::stdout_result(Err(Error::from(ErrorKind::BrokenPipe))).unwrap_err();
+        assert!(closed.is::<super::StdoutClosed>());
+        // anything else stays a real error
+        let other =
+            super::stdout_result(Err(Error::from(ErrorKind::PermissionDenied))).unwrap_err();
+        assert!(!other.is::<super::StdoutClosed>());
+        assert!(other.to_string().contains("writing to stdout"));
     }
 
     #[test]
