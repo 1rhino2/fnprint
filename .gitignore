@@ -6,3 +6,5 @@ fuzz/corpus/
 fuzz/artifacts/
 fuzz/Cargo.lock
 *.so
+# make completions output
+/fnprint.bash

@@ -135,7 +135,11 @@ tables print (0 = all). `json` and `r2` output are never capped, so scripts get
 everything.
 
 `completions` writes a script for `bash`, `zsh`, `fish`, `powershell`, or
-`elvish`, e.g. `fnprint completions bash > /etc/bash_completion.d/fnprint`.
+`elvish`, e.g.
+`fnprint completions bash > ~/.local/share/bash-completion/completions/fnprint`.
+
+piping any output into something that stops reading early (`| head`) exits
+quietly, so the tables are safe to skim without `--limit`.
 
 ## machine output
 
