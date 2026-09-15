@@ -300,7 +300,7 @@ checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "fnprint"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "fnprint-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "fnprint-db",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "fnprint-db"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "fnprint-sig",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "fnprint-emu"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "capstone",
  "fnprint-loader",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "fnprint-loader"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "gimli",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "fnprint-sandbox"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "fnprint-sig"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "fnprint-trace",
  "serde",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "fnprint-trace"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
 ]

@@ -7,6 +7,8 @@ Dates are the tag dates. Older entries are summarized from the release commits.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-14
+
 ### Fixed
 - Piping human or json output into a reader that closes early (`fnprint query
   ... | head`) now exits 0 quietly. It used to abort with a panic banner because
@@ -129,7 +131,8 @@ First tagged release. Builds on the initial behavioral-fingerprinting engine
 ### Security
 - Sandboxed the emulator, hardened the build.
 
-[Unreleased]: https://github.com/1rhino2/fnprint/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/1rhino2/fnprint/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/1rhino2/fnprint/releases/tag/v0.5.1
 [0.5.0]: https://github.com/1rhino2/fnprint/releases/tag/v0.5.0
 [0.4.3]: https://github.com/1rhino2/fnprint/releases/tag/v0.4.3
 [0.4.2]: https://github.com/1rhino2/fnprint/releases/tag/v0.4.2
