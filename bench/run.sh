@@ -11,11 +11,14 @@ bash "$here/build_zlib.sh" "$work"
 bash "$here/build_lua.sh" "$work"
 B="$work/builds"
 
+# two views per pair. raw: each function ranked alone (rank-1, MRR), the print
+# quality on its own. aligned: the 1:1 + call-graph assignment query/match
+# actually use (acc = right partner, prec/recall at the same-threshold).
 row() { # a b label
   printf "%-22s " "$3"
   "$fp" eval "$B/$1" "$B/$2" | awk '
-    /rank-1/{r=$3} /MRR/{m=$2} /precision/{p=$2; tp=$4; fp2=$6} /recall/{rc=$2}
-    END{printf "rank1 %-6s MRR %-6s prec %-7s recall %s\n", r, m, p, rc}'
+    /rank-1/{r=$3} /MRR/{m=$2} /aligned-acc/{a=$2} /aligned-prec/{p=$2} /aligned-recall/{rc=$2}
+    END{printf "rank1 %-6s MRR %-6s | aligned acc %-6s prec %-7s recall %s\n", r, m, a, p, rc}'
 }
 echo "== same compiler, across optimization =="
 row libz_gcc_O0.so libz_gcc_O1.so "gcc O0 -> O1"

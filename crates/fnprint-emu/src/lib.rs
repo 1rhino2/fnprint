@@ -423,6 +423,97 @@ impl MicroExec {
     }
 }
 
+/// the static call graph of one function: every direct `call` target inside the
+/// image, every `call [rip+slot]` / direct call that resolves through `imports`
+/// (returned by name), and a direct `jmp` that leaves the body (a tail call).
+/// linear sweep, so it sees calls microexecution never reached on junk input,
+/// which is most of a real function. returns (in-image callee entries, import
+/// names), both deduped and sorted.
+pub fn static_calls(
+    image: &Image,
+    func: &Func,
+    imports: &HashMap<u64, String>,
+) -> (Vec<u64>, Vec<String>) {
+    let mut callees: Vec<u64> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let Ok(cs) = Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .build()
+    else {
+        return (callees, names);
+    };
+    let lo = func.entry;
+    let hi = func.entry.saturating_add(func.size);
+    // a crafted size can claim the whole image; a real function is far under this
+    let Some(code) = image.code_at(lo, func.size.min(1 << 20) as usize) else {
+        return (callees, names);
+    };
+    let segs: Vec<(u64, u64)> = image
+        .segments
+        .iter()
+        .map(|s| (s.vaddr, s.vaddr.saturating_add(s.bytes.len() as u64)))
+        .collect();
+    let in_image = |t: u64| segs.iter().any(|&(a, b)| t >= a && t < b);
+    let mut off = 0usize;
+    // capstone stops at the first byte it can't decode; step past it and keep
+    // going so one odd byte (padding, data in text) doesn't hide the rest.
+    while off < code.len() {
+        let addr = lo + off as u64;
+        let Ok(insns) = cs.disasm_all(&code[off..], addr) else {
+            break;
+        };
+        let mut advanced = 0usize;
+        for insn in insns.iter() {
+            let b = insn.bytes();
+            let ilen = b.len() as u64;
+            let a = insn.address();
+            advanced += b.len();
+            let m = insn.mnemonic().unwrap_or("");
+            let target = if b[0] == 0xe8 && b.len() >= 5 {
+                let rel = i32::from_le_bytes([b[1], b[2], b[3], b[4]]) as i64;
+                Some(a.wrapping_add(ilen).wrapping_add(rel as u64))
+            } else if b[0] == 0xe9 && b.len() >= 5 && m == "jmp" {
+                let rel = i32::from_le_bytes([b[1], b[2], b[3], b[4]]) as i64;
+                let t = a.wrapping_add(ilen).wrapping_add(rel as u64);
+                // a jmp inside the body is a loop/branch, outside it is a tail call
+                if t >= lo && t < hi {
+                    None
+                } else {
+                    Some(t)
+                }
+            } else if b.len() >= 6 && b[0] == 0xff && (b[1] == 0x15 || b[1] == 0x25) {
+                // call/jmp [rip+disp32]: the got slot, named if it is an import
+                let rel = i32::from_le_bytes([b[2], b[3], b[4], b[5]]) as i64;
+                let slot = a.wrapping_add(ilen).wrapping_add(rel as u64);
+                if let Some(n) = imports.get(&slot) {
+                    names.push(n.clone());
+                }
+                None
+            } else {
+                None
+            };
+            if let Some(t) = target {
+                if let Some(n) = imports.get(&t) {
+                    names.push(n.clone());
+                } else if in_image(t) {
+                    callees.push(t);
+                }
+            }
+        }
+        if advanced == 0 {
+            off += 1;
+        } else {
+            off += advanced;
+        }
+    }
+    callees.sort_unstable();
+    callees.dedup();
+    names.sort();
+    names.dedup();
+    (callees, names)
+}
+
 fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> {
     // lazy memory: map + deterministically fill any data page we touch.
     // an unmapped *fetch* means we ran off into nonsense, so bail on those.

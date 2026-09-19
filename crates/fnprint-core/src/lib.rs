@@ -10,6 +10,9 @@ use fnprint_loader::{Func, FuncSource};
 use fnprint_sig::Fingerprint;
 use rayon::prelude::*;
 
+pub mod align;
+pub use align::{Opts as AlignOpts, Pair, GRAPH_WEIGHT};
+
 /// below this we don't trust a match, thunks and tiny leaves all look alike
 pub const MIN_COMPLEXITY: u32 = 4;
 /// two prints this close are "the same function"
@@ -114,6 +117,15 @@ pub fn index_bytes_shard(
     // survive strip, so they are the stable part. internal direct calls are kept
     // as callee edges instead and used by the call-graph pass at match time.
     let symbols = Arc::new(loaded.imports.clone());
+    // a PIC .so calls its own exported functions through the plt, so those show
+    // up as Call(Sym(name)) with no direct target. if that name is defined in
+    // this image, it is a call-graph edge too (dynsym keeps the name on a
+    // stripped .so, so the edge is there on both sides).
+    let local_by_name: HashMap<&str, u64> = loaded
+        .funcs
+        .iter()
+        .filter_map(|f| f.name.as_deref().map(|n| (n, f.entry)))
+        .collect();
 
     let out: Vec<IndexedFunc> = loaded
         .funcs
@@ -141,10 +153,24 @@ pub fn index_bytes_shard(
             // body is actually observable, since input-dependent branches differ
             // by seed. from_traces already unions the effects.
             let coverage = traces.iter().map(|t| t.coverage).fold(0.0f32, f32::max);
-            let mut callees: Vec<u64> = traces
-                .iter()
-                .flat_map(|t| t.callees.iter().copied())
-                .collect();
+            // call-graph edges: the static sweep (every call in the body) plus
+            // whatever the runs actually executed, which the sweep can miss on
+            // an indirect target. import names that are local functions (a PIC
+            // .so calling its own exports through the plt) become edges too.
+            let (mut callees, import_names) = fnprint_emu::static_calls(image, f, &loaded.imports);
+            callees.extend(traces.iter().flat_map(|t| t.callees.iter().copied()));
+            let dyn_names = traces.iter().flat_map(|t| {
+                t.effects.iter().filter_map(|e| match e {
+                    fnprint_trace::Effect::Call(fnprint_trace::CallTarget::Sym(n)) => Some(n),
+                    _ => None,
+                })
+            });
+            for n in import_names.iter().chain(dyn_names) {
+                if let Some(&entry) = local_by_name.get(n.as_str()) {
+                    callees.push(entry);
+                }
+            }
+            callees.retain(|&e| e != f.entry);
             callees.sort_unstable();
             callees.dedup();
             IndexedFunc {
@@ -182,6 +208,9 @@ pub fn index_to_db(bytes: &[u8], binary: &str, db: &Db, cfg: Config) -> Result<u
 pub struct Changed {
     pub name: String,
     pub similarity: f64,
+    /// set on an aligned (name-free) match: where the pair sits in each build
+    pub entry_a: Option<u64>,
+    pub entry_b: Option<u64>,
 }
 
 #[derive(Default)]
@@ -229,6 +258,8 @@ pub fn match_by_name(a: &[IndexedFunc], b: &[IndexedFunc]) -> MatchReport {
                     rep.changed.push(Changed {
                         name: name.to_string(),
                         similarity: sim,
+                        entry_a: Some(fa.entry),
+                        entry_b: Some(fb.entry),
                     });
                 }
             }
@@ -253,6 +284,81 @@ pub fn match_by_name(a: &[IndexedFunc], b: &[IndexedFunc]) -> MatchReport {
     rep
 }
 
+/// true when both sides carry enough symbol names to align by name. a stripped
+/// build has none (eh_frame discovery), so match falls back to `match_aligned`.
+pub fn both_named(a: &[IndexedFunc], b: &[IndexedFunc]) -> bool {
+    let named = |v: &[IndexedFunc]| v.iter().filter(|f| f.name.is_some()).count();
+    named(a) > 0 && named(b) > 0
+}
+
+/// diff two builds with no symbol names: align a to b 1:1 on behavior plus the
+/// call graph, then read the pairs. an accepted pair at or above SAME_THRESH is
+/// unchanged, below it is changed, and whatever found no partner is only_a /
+/// only_b. this is the stripped-firmware view BinDiff gives you that the
+/// by-name path can't.
+pub fn match_aligned(a: &[IndexedFunc], b: &[IndexedFunc], graph_weight: f64) -> MatchReport {
+    let an: Vec<align::Node> = a.iter().map(align::Node::from_indexed).collect();
+    let bn: Vec<align::Node> = b.iter().map(align::Node::from_indexed).collect();
+    // accept anything with a plausible partner (a changed function is still
+    // the same function), and let SAME_THRESH split changed from unchanged.
+    let pairs = align::align(
+        &an,
+        &bn,
+        align::Opts {
+            threshold: 0.45,
+            graph_weight,
+            rounds: 2,
+        },
+    );
+    let mut rep = MatchReport::default();
+    let mut a_paired = vec![false; a.len()];
+    let mut b_paired = vec![false; b.len()];
+    for p in &pairs {
+        a_paired[p.a] = true;
+        b_paired[p.b] = true;
+        rep.compared += 1;
+        if p.sim >= SAME_THRESH {
+            rep.same += 1;
+        } else {
+            let label = match (&a[p.a].name, &b[p.b].name) {
+                (Some(x), Some(y)) if x == y => x.clone(),
+                (Some(x), Some(y)) => format!("{x} -> {y}"),
+                (Some(x), None) | (None, Some(x)) => x.clone(),
+                (None, None) => format!("{:#x} -> {:#x}", a[p.a].entry, b[p.b].entry),
+            };
+            rep.changed.push(Changed {
+                name: label,
+                similarity: p.sim,
+                entry_a: Some(a[p.a].entry),
+                entry_b: Some(b[p.b].entry),
+            });
+        }
+    }
+    let label = |f: &IndexedFunc| f.name.clone().unwrap_or_else(|| format!("{:#x}", f.entry));
+    for (i, f) in a.iter().enumerate() {
+        if !a_paired[i] && f.fp.complexity >= MIN_COMPLEXITY && f.fp.shingles > 0 {
+            rep.only_a.push(label(f));
+        }
+    }
+    for (j, f) in b.iter().enumerate() {
+        if !b_paired[j] && f.fp.complexity >= MIN_COMPLEXITY && f.fp.shingles > 0 {
+            rep.only_b.push(label(f));
+        }
+    }
+    rep.low_signal = a
+        .iter()
+        .filter(|f| f.fp.complexity < MIN_COMPLEXITY || f.fp.shingles == 0)
+        .count();
+    rep.changed.sort_by(|x, y| {
+        x.similarity
+            .total_cmp(&y.similarity)
+            .then_with(|| x.name.cmp(&y.name))
+    });
+    rep.only_a.sort();
+    rep.only_b.sort();
+    rep
+}
+
 // -------- query (auto-name against a corpus) --------
 
 pub struct Named {
@@ -260,6 +366,10 @@ pub struct Named {
     pub guess: String,
     pub from_binary: String,
     pub similarity: f64,
+    /// call-graph consistency of the pair, 0 when there were no edges to check
+    pub graph: f64,
+    /// what the assignment ranked on: similarity lifted by the graph, <= 1
+    pub score: f64,
 }
 
 /// best-scoring named function in a corpus for one print. narrows with the LSH
@@ -301,31 +411,49 @@ fn best_in_corpus<C: Corpus>(
     Ok(best)
 }
 
-/// for each function in the target that we can trust, pull the best-matching
-/// named function out of the corpus db. withholds tiny/low-signal functions.
+/// name the target's functions from a corpus: a global 1:1 alignment (a corpus
+/// function is claimed once) with call-graph propagation, then keep the pairs
+/// whose score clears `threshold`. withholds tiny/low-signal functions and
+/// unnamed corpus rows.
 pub fn query_corpus<C: Corpus>(
     target: &[IndexedFunc],
     corpus: &C,
     threshold: f64,
+    graph_weight: f64,
 ) -> Result<Vec<Named>> {
-    let named = corpus.all()?; // small corpora, fine to hold in memory
-    let mut out = Vec::new();
-    for f in target {
-        if f.fp.complexity < MIN_COMPLEXITY || f.fp.shingles == 0 {
-            continue;
-        }
-        if let Some((sim, name, bin)) = best_in_corpus(&f.fp, corpus, &named)? {
-            if sim >= threshold {
-                out.push(Named {
-                    entry: f.entry,
-                    guess: name,
-                    from_binary: bin,
-                    similarity: sim,
-                });
-            }
-        }
-    }
-    out.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
+    let recs: Vec<fnprint_db::FuncRec> = corpus
+        .all()? // small corpora, fine to hold in memory
+        .into_iter()
+        .filter(|r| r.name.is_some())
+        .collect();
+    let tn: Vec<align::Node> = target.iter().map(align::Node::from_indexed).collect();
+    let cn: Vec<align::Node> = recs.iter().map(align::Node::from_rec).collect();
+    let pairs = align::align(
+        &tn,
+        &cn,
+        align::Opts {
+            threshold,
+            graph_weight,
+            rounds: 2,
+        },
+    );
+    let mut out: Vec<Named> = pairs
+        .iter()
+        .map(|p| Named {
+            entry: target[p.a].entry,
+            guess: recs[p.b].name.clone().unwrap_or_default(),
+            from_binary: recs[p.b].binary.clone(),
+            similarity: p.sim,
+            graph: p.graph,
+            score: p.score,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(b.similarity.total_cmp(&a.similarity))
+            .then(a.entry.cmp(&b.entry))
+    });
     Ok(out)
 }
 
@@ -387,19 +515,32 @@ pub fn triage<C: Corpus>(
     min_sim: f64,
     margin: f64,
 ) -> Result<Vec<TriageHit>> {
-    let vuln_all = vuln.all()?;
-    let patched_all = patched.all()?;
+    // deliberately NOT a 1:1 alignment. triage asks "how close is this function
+    // to anything on each side", and two behavioral twins in the target must both
+    // be allowed to sit at 100% on both sides so they come back inconclusive. a
+    // 1:1 pass hands the twin to one of them and leaves the other with a 0% side
+    // and a bogus +100 margin (seen on crc32_little in the case study).
+    let side = |db: &C| -> Result<Vec<Option<(f64, String)>>> {
+        let recs: Vec<fnprint_db::FuncRec> =
+            db.all()?.into_iter().filter(|r| r.name.is_some()).collect();
+        let mut best: Vec<Option<(f64, String)>> = vec![None; target.len()];
+        for (i, f) in target.iter().enumerate() {
+            if f.fp.complexity < MIN_COMPLEXITY || f.fp.shingles == 0 {
+                continue;
+            }
+            best[i] = best_in_corpus(&f.fp, db, &recs)?.map(|(s, n, _)| (s, n));
+        }
+        Ok(best)
+    };
+    let v = side(vuln)?;
+    let pt = side(patched)?;
     let mut out = Vec::new();
-    for f in target {
+    for (i, f) in target.iter().enumerate() {
         if f.fp.complexity < MIN_COMPLEXITY || f.fp.shingles == 0 {
             continue;
         }
-        let (vuln_sim, vuln_name) = best_in_corpus(&f.fp, vuln, &vuln_all)?
-            .map(|(s, n, _)| (s, n))
-            .unwrap_or((0.0, String::new()));
-        let (patched_sim, patched_name) = best_in_corpus(&f.fp, patched, &patched_all)?
-            .map(|(s, n, _)| (s, n))
-            .unwrap_or((0.0, String::new()));
+        let (vuln_sim, vuln_name) = v[i].clone().unwrap_or((0.0, String::new()));
+        let (patched_sim, patched_name) = pt[i].clone().unwrap_or((0.0, String::new()));
 
         let top = vuln_sim.max(patched_sim);
         let verdict = if top < min_sim {
@@ -425,11 +566,10 @@ pub fn triage<C: Corpus>(
         verdict_order(a.verdict)
             .cmp(&verdict_order(b.verdict))
             .then(b.vuln_sim.total_cmp(&a.vuln_sim))
+            .then(a.entry.cmp(&b.entry))
     });
     Ok(out)
 }
-
-// -------- eval (accuracy metrics against symbol-name ground truth) --------
 
 pub struct EvalResult {
     /// functions in A that we scored (had signal and a same-named twin in B)
@@ -449,6 +589,13 @@ pub struct EvalResult {
     /// scored functions where the top-1 similarity was below SAME_THRESH, i.e.
     /// the tool would decline to make a confident call rather than guess.
     pub abstained: usize,
+    /// aligned (1:1 + call graph) view, what query actually does: of the scored
+    /// functions, how many got the right partner; and of the pairs accepted at
+    /// SAME_THRESH, how many were right.
+    pub align_correct: usize,
+    pub align_paired: usize,
+    pub align_tp: usize,
+    pub align_fp: usize,
 }
 
 impl EvalResult {
@@ -500,11 +647,35 @@ impl EvalResult {
             self.abstained as f64 / self.scored as f64
         }
     }
+    /// fraction of scored functions whose aligned partner is the right one
+    pub fn align_acc(&self) -> f64 {
+        if self.scored == 0 {
+            0.0
+        } else {
+            self.align_correct as f64 / self.scored as f64
+        }
+    }
+    /// of the aligned pairs accepted at SAME_THRESH, how many were right
+    pub fn align_precision(&self) -> f64 {
+        let d = self.align_tp + self.align_fp;
+        if d == 0 {
+            0.0
+        } else {
+            self.align_tp as f64 / d as f64
+        }
+    }
+    pub fn align_recall(&self) -> f64 {
+        if self.scored == 0 {
+            0.0
+        } else {
+            self.align_tp as f64 / self.scored as f64
+        }
+    }
 }
 
 /// rank every signal-bearing function in A against all of B, using symbol names
 /// as ground truth. this is the headline accuracy measurement.
-pub fn eval(a: &[IndexedFunc], b: &[IndexedFunc]) -> EvalResult {
+pub fn eval(a: &[IndexedFunc], b: &[IndexedFunc], graph_weight: f64) -> EvalResult {
     let bsig: Vec<&IndexedFunc> = b
         .iter()
         .filter(|f| f.fp.complexity >= MIN_COMPLEXITY && f.fp.shingles > 0 && f.name.is_some())
@@ -519,9 +690,31 @@ pub fn eval(a: &[IndexedFunc], b: &[IndexedFunc]) -> EvalResult {
         fn_: 0,
         ranks: Vec::new(),
         abstained: 0,
+        align_correct: 0,
+        align_paired: 0,
+        align_tp: 0,
+        align_fp: 0,
     };
 
-    for fa in a {
+    // the aligned view: accept every plausible pair (low threshold), then score
+    // it against the names. accepted-at-SAME_THRESH gives the precision row.
+    let an: Vec<align::Node> = a.iter().map(align::Node::from_indexed).collect();
+    let bn: Vec<align::Node> = b.iter().map(align::Node::from_indexed).collect();
+    let pairs = align::align(
+        &an,
+        &bn,
+        align::Opts {
+            threshold: 0.2,
+            graph_weight,
+            rounds: 2,
+        },
+    );
+    let mut partner: HashMap<usize, &align::Pair> = HashMap::new();
+    for p in &pairs {
+        partner.insert(p.a, p);
+    }
+
+    for (ia, fa) in a.iter().enumerate() {
         if fa.fp.complexity < MIN_COMPLEXITY || fa.fp.shingles == 0 {
             continue;
         }
@@ -564,6 +757,21 @@ pub fn eval(a: &[IndexedFunc], b: &[IndexedFunc]) -> EvalResult {
             (true, false) => res.fp += 1,
             (false, true) => res.fn_ += 1,
             (false, false) => {}
+        }
+
+        if let Some(p) = partner.get(&ia) {
+            res.align_paired += 1;
+            let right = b[p.b].name.as_deref() == Some(aname);
+            if right {
+                res.align_correct += 1;
+            }
+            if p.score >= SAME_THRESH {
+                if right {
+                    res.align_tp += 1;
+                } else {
+                    res.align_fp += 1;
+                }
+            }
         }
     }
     res

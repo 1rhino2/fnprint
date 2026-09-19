@@ -8,8 +8,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use fnprint_core::{
-    dump_traces, eval, index_bytes, index_bytes_shard, match_by_name, query_corpus, source_str,
-    triage, warm_pool, EffectTrace, IndexedFunc, Verdict, MIN_COMPLEXITY,
+    both_named, dump_traces, eval, index_bytes, index_bytes_shard, match_aligned, match_by_name,
+    query_corpus, source_str, triage, warm_pool, EffectTrace, IndexedFunc, Verdict, MIN_COMPLEXITY,
 };
 use fnprint_db::{Db, FuncPrint, FuncRec, MemCorpus};
 use fnprint_emu::Config;
@@ -168,6 +168,11 @@ struct Cli {
     /// only) that renames matched functions.
     #[arg(long, value_enum, default_value_t = Format::Human, global = true)]
     format: Format,
+    /// how much a consistent call-graph neighbourhood lifts a pair when
+    /// aligning (query, aligned match, eval; triage scores each side on its own). 0 turns propagation off
+    /// and scores each function on its behavior alone.
+    #[arg(long, default_value_t = fnprint_core::GRAPH_WEIGHT, global = true)]
+    graph_weight: f64,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -198,6 +203,11 @@ enum Cmd {
         /// max changed rows to print (0 = all). json output is never capped.
         #[arg(long, default_value_t = 40)]
         limit: usize,
+        /// align the two builds on behavior + call graph instead of by symbol
+        /// name. automatic when either side is stripped; force it here to see
+        /// what the name-free view says about a symboled pair.
+        #[arg(long)]
+        align: bool,
     },
     /// name unknown functions in a binary using a corpus db
     Query {
@@ -255,16 +265,20 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let ns = cli.no_sandbox;
     let fmt = cli.format;
+    let gw = cli.graph_weight;
+    if !gw.is_finite() || gw < 0.0 {
+        bail!("--graph-weight must be a non-negative number");
+    }
     let res = match cli.cmd {
         Cmd::Index { binary, out } => cmd_index(&binary, out.as_deref(), ns, fmt),
-        Cmd::Match { a, b, limit } => cmd_match(&a, &b, limit, ns, fmt),
+        Cmd::Match { a, b, limit, align } => cmd_match(&a, &b, limit, align, gw, ns, fmt),
         Cmd::Query {
             target,
             corpus,
             threshold,
             limit,
-        } => cmd_query(&target, &corpus, threshold, limit, ns, fmt),
-        Cmd::Eval { a, b } => cmd_eval(&a, &b, ns, fmt),
+        } => cmd_query(&target, &corpus, threshold, limit, gw, ns, fmt),
+        Cmd::Eval { a, b } => cmd_eval(&a, &b, gw, ns, fmt),
         Cmd::Triage {
             target,
             vuln,
@@ -964,22 +978,46 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool, fmt: Format) -> 
     Ok(())
 }
 
-fn cmd_match(a: &str, b: &str, limit: usize, no_sandbox: bool, fmt: Format) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_match(
+    a: &str,
+    b: &str,
+    limit: usize,
+    force_align: bool,
+    graph_weight: f64,
+    no_sandbox: bool,
+    fmt: Format,
+) -> Result<()> {
     if fmt == Format::R2 {
         bail!("r2 output is only supported for query and triage");
     }
     let ia = load_index(a, no_sandbox)?;
     let ib = load_index(b, no_sandbox)?;
-    let rep = match_by_name(&ia, &ib);
+    // by name when both sides have symbols, otherwise (stripped firmware, the
+    // usual case) align on behavior + call graph. --align forces the latter.
+    let aligned = force_align || !both_named(&ia, &ib);
+    let rep = if aligned {
+        match_aligned(&ia, &ib, graph_weight)
+    } else {
+        match_by_name(&ia, &ib)
+    };
 
     if fmt == Format::Json {
         let changed: Vec<serde_json::Value> = rep
             .changed
             .iter()
-            .map(|c| serde_json::json!({ "name": esc(&c.name), "similarity": c.similarity }))
+            .map(|c| {
+                serde_json::json!({
+                    "name": esc(&c.name),
+                    "similarity": c.similarity,
+                    "entry_a": c.entry_a.map(|e| format!("{e:#x}")),
+                    "entry_b": c.entry_b.map(|e| format!("{e:#x}")),
+                })
+            })
             .collect();
         return emit_json(&serde_json::json!({
             "schema_version": OUTPUT_SCHEMA_VERSION,
+            "mode": if aligned { "aligned" } else { "name" },
             "compared": rep.compared,
             "unchanged": rep.same,
             "changed": changed,
@@ -989,7 +1027,14 @@ fn cmd_match(a: &str, b: &str, limit: usize, no_sandbox: bool, fmt: Format) -> R
         }));
     }
 
-    outln!("compared {} functions present in both", rep.compared);
+    if aligned {
+        outln!(
+            "aligned {} function pairs by behavior + call graph (no symbol names needed)",
+            rep.compared
+        );
+    } else {
+        outln!("compared {} functions present in both", rep.compared);
+    }
     outln!("  unchanged:  {}", rep.same);
     outln!("  changed:    {}", rep.changed.len());
     outln!("  low-signal: {} (too small to judge)", rep.low_signal);
@@ -1017,12 +1062,13 @@ fn cmd_query(
     corpus: &str,
     threshold: f64,
     limit: usize,
+    graph_weight: f64,
     no_sandbox: bool,
     fmt: Format,
 ) -> Result<()> {
     let it = load_index(target, no_sandbox)?;
     let db = load_corpus(corpus, no_sandbox)?;
-    let named = query_corpus(&it, &db, threshold)?;
+    let named = query_corpus(&it, &db, threshold, graph_weight)?;
 
     if fmt == Format::Json {
         let list: Vec<serde_json::Value> = named
@@ -1033,6 +1079,8 @@ fn cmd_query(
                     "guess": esc(&n.guess),
                     "from_binary": esc(&n.from_binary),
                     "similarity": n.similarity,
+                    "graph": n.graph,
+                    "score": n.score,
                 })
             })
             .collect();
@@ -1065,11 +1113,13 @@ fn cmd_query(
         return Ok(());
     }
     outln!("named {} function(s):", named.len());
+    outln!("  addr        sim    graph  name");
     for n in named.iter().take(row_cap(limit)) {
         outln!(
-            "  {:#010x}  {:>5.1}%  {}  ({})",
+            "  {:#010x}  {:>5.1}%  {:>4.0}%  {}  ({})",
             n.entry,
             n.similarity * 100.0,
+            n.graph * 100.0,
             esc(&n.guess),
             esc(&n.from_binary)
         );
@@ -1084,13 +1134,13 @@ fn cmd_query(
     Ok(())
 }
 
-fn cmd_eval(a: &str, b: &str, no_sandbox: bool, fmt: Format) -> Result<()> {
+fn cmd_eval(a: &str, b: &str, graph_weight: f64, no_sandbox: bool, fmt: Format) -> Result<()> {
     if fmt == Format::R2 {
         bail!("r2 output is only supported for query and triage");
     }
     let ia = load_index(a, no_sandbox)?;
     let ib = load_index(b, no_sandbox)?;
-    let r = eval(&ia, &ib);
+    let r = eval(&ia, &ib, graph_weight);
 
     if fmt == Format::Json {
         return emit_json(&serde_json::json!({
@@ -1106,6 +1156,12 @@ fn cmd_eval(a: &str, b: &str, no_sandbox: bool, fmt: Format) -> Result<()> {
             "tp": r.tp,
             "fp": r.fp,
             "abstained": r.abstained,
+            "align_acc": r.align_acc(),
+            "align_precision": r.align_precision(),
+            "align_recall": r.align_recall(),
+            "align_tp": r.align_tp,
+            "align_fp": r.align_fp,
+            "align_paired": r.align_paired,
         }));
     }
 
@@ -1127,6 +1183,23 @@ fn cmd_eval(a: &str, b: &str, no_sandbox: bool, fmt: Format) -> Result<()> {
         r.abstained,
         r.scored
     );
+    outln!(
+        "aligned (1:1 + call graph, what query does; graph weight {:.2}):",
+        graph_weight
+    );
+    outln!(
+        "  aligned-acc:     {:.1}%  ({} of {} paired right)",
+        r.align_acc() * 100.0,
+        r.align_correct,
+        r.scored
+    );
+    outln!(
+        "  aligned-prec:    {:.1}%  ({} tp / {} fp at same-threshold)",
+        r.align_precision() * 100.0,
+        r.align_tp,
+        r.align_fp
+    );
+    outln!("  aligned-recall:  {:.1}%", r.align_recall() * 100.0);
     Ok(())
 }
 
