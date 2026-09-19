@@ -605,9 +605,13 @@ pub fn static_calls(
     let in_image = |t: u64| segs.iter().any(|&(a, b)| t >= a && t < b);
     if image.arch == Isa::Aarch64 {
         // bl = call, b out of the body = tail call. both pc-relative imm26.
-        for (i, w) in code.chunks_exact(4).enumerate() {
-            let a = lo.wrapping_add((i * 4) as u64);
-            let w = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        // manual 4-byte stride, not chunks_exact: newer clippy rewrites that into
+        // as_chunks, which is past our MSRV (same note as decode_sig in fnprint-db).
+        let mut i = 0usize;
+        while i + 4 <= code.len() {
+            let a = lo.wrapping_add(i as u64);
+            let w = u32::from_le_bytes([code[i], code[i + 1], code[i + 2], code[i + 3]]);
+            i += 4;
             let t = if w & 0xfc00_0000 == 0x9400_0000 {
                 Some(a64_rel(a, w & 0x03ff_ffff, 26))
             } else if w & 0xfc00_0000 == 0x1400_0000 {
