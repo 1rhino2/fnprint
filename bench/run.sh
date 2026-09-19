@@ -34,6 +34,22 @@ echo "== lua (bigger pool, the frontier) =="
 row liblua_gcc_O0.so liblua_gcc_O2.so "lua gcc O0 -> O2"
 row liblua_gcc_O2.so liblua_gcc_O3.so "lua gcc O2 -> O3"
 
+# cross-arch: the same source built for aarch64. bench/build_arm64.sh makes
+# these (needs aarch64-linux-gnu-gcc, or run it in a container, see the script).
+if [ -f "$B/libz_arm64_O0.so" ]; then
+  echo "== cross arch, x86-64 -> aarch64 =="
+  row libz_gcc_O0.so libz_arm64_O0.so "zlib x86 O0 -> arm O0"
+  row libz_gcc_O2.so libz_arm64_O2.so "zlib x86 O2 -> arm O2"
+  row libz_gcc_O0.so libz_arm64_O2.so "zlib x86 O0 -> arm O2"
+  row liblua_gcc_O0.so liblua_arm64_O0.so "lua x86 O0 -> arm O0"
+  row liblua_gcc_O2.so liblua_arm64_O2.so "lua x86 O2 -> arm O2"
+  echo "== aarch64 only, across optimization =="
+  row libz_arm64_O0.so libz_arm64_O2.so "zlib arm O0 -> O2"
+  row liblua_arm64_O0.so liblua_arm64_O2.so "lua arm O0 -> O2"
+else
+  echo "(no arm64 builds, skipping cross-arch rows: bench/build_arm64.sh)"
+fi
+
 # determinism gate: the same binary indexed twice must produce a byte-identical
 # corpus, and (once sharding lands) the shard count must not change the output.
 # fingerprints are per-function independent and the func list is sorted by entry,
@@ -41,6 +57,9 @@ row liblua_gcc_O2.so liblua_gcc_O3.so "lua gcc O2 -> O3"
 # change ever breaks it.
 echo "== determinism gate =="
 det_bin="$B/libz_gcc_O2.so"
+# index -o appends to an existing corpus (that is how a multi-binary corpus is
+# built), so start from fresh files or the gate compares stale stacks.
+rm -f "$work"/det_a.db "$work"/det_b.db "$work"/det_s1.db "$work"/det_s8.db
 "$fp" index "$det_bin" -o "$work/det_a.db"
 "$fp" index "$det_bin" -o "$work/det_b.db"
 if cmp -s "$work/det_a.db" "$work/det_b.db"; then

@@ -11,10 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use capstone::prelude::*;
-use fnprint_loader::{Func, Image};
+use fnprint_loader::{Arch as Isa, Func, Image};
 use fnprint_trace::{CallTarget, Effect, EffectTrace, Region, ValueClass};
 use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot};
-use unicorn_engine::{RegisterX86, Unicorn};
+use unicorn_engine::{RegisterARM64, RegisterX86, Unicorn};
 
 const PAGE: u64 = 0x1000;
 const NARGS: usize = 6;
@@ -115,7 +115,10 @@ struct Rec {
     seen_heapish: HashSet<u64>,
     seen_reads: HashSet<u64>,
     heapish_count: usize,
-    cs: Capstone,
+    // x86 needs a real decoder for instruction length and kind. aarch64 is
+    // fixed-width and the handful of kinds we steer on decode from bit masks.
+    cs: Option<Capstone>,
+    isa: Isa,
     // shared, not owned per-run: cloning this into every Rec deep-copied the whole
     // symbol map once per force-path. an Arc makes the per-run clone a refcount bump.
     symbols: Arc<HashMap<u64, String>>,
@@ -389,11 +392,16 @@ impl MicroExec {
         force: &[bool],
         start: u64,
     ) -> Result<RunOut, unicorn_engine::uc_error> {
-        let cs = Capstone::new()
-            .x86()
-            .mode(arch::x86::ArchMode::Mode64)
-            .build()
-            .map_err(|_| unicorn_engine::uc_error::EXCEPTION)?;
+        let cs = match image.arch {
+            Isa::X86_64 => Some(
+                Capstone::new()
+                    .x86()
+                    .mode(arch::x86::ArchMode::Mode64)
+                    .build()
+                    .map_err(|_| unicorn_engine::uc_error::EXCEPTION)?,
+            ),
+            Isa::Aarch64 => None,
+        };
 
         let rec = Rec {
             effects: Vec::new(),
@@ -404,6 +412,7 @@ impl MicroExec {
             seen_reads: HashSet::new(),
             heapish_count: 0,
             cs,
+            isa: image.arch,
             symbols: symbols.clone(),
             ret_ctr: 0,
             cfg: self.cfg.clone(),
@@ -425,7 +434,11 @@ impl MicroExec {
             callees: HashSet::new(),
         };
 
-        let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, rec)?;
+        let (ua, um) = match image.arch {
+            Isa::X86_64 => (Arch::X86, Mode::MODE_64),
+            Isa::Aarch64 => (Arch::ARM64, Mode::LITTLE_ENDIAN),
+        };
+        let mut uc = Unicorn::new_with_data(ua, um, rec)?;
         let mut mapped: HashSet<u64> = HashSet::new();
 
         for s in &image.segments {
@@ -442,27 +455,49 @@ impl MicroExec {
         }
 
         ensure_pages(&mut uc, &mut mapped, STACK_BASE, STACK_SIZE)?;
-        uc.reg_write(RegisterX86::RSP, RSP0)?;
-        uc.reg_write(RegisterX86::RBP, RSP0)?;
+        // the return sentinel: on x86 it is the word at [rsp] the final ret
+        // pops, on aarch64 it is the link register. either way the run ends
+        // when the function returns to it, and emu_start stops there.
         uc.mem_write(RSP0, &RET_ADDR.to_le_bytes())?;
-
-        let argregs = [
-            RegisterX86::RDI,
-            RegisterX86::RSI,
-            RegisterX86::RDX,
-            RegisterX86::RCX,
-            RegisterX86::R8,
-            RegisterX86::R9,
-        ];
-        for (k, r) in argregs.iter().enumerate() {
-            uc.reg_write(*r, Rec::arg_base(k))?;
+        match image.arch {
+            Isa::X86_64 => {
+                uc.reg_write(RegisterX86::RSP, RSP0)?;
+                uc.reg_write(RegisterX86::RBP, RSP0)?;
+                let argregs = [
+                    RegisterX86::RDI,
+                    RegisterX86::RSI,
+                    RegisterX86::RDX,
+                    RegisterX86::RCX,
+                    RegisterX86::R8,
+                    RegisterX86::R9,
+                ];
+                for (k, r) in argregs.iter().enumerate() {
+                    uc.reg_write(*r, Rec::arg_base(k))?;
+                }
+            }
+            Isa::Aarch64 => {
+                uc.reg_write(RegisterARM64::SP, RSP0)?;
+                uc.reg_write(RegisterARM64::X29, RSP0)?;
+                uc.reg_write(RegisterARM64::X30, RET_ADDR)?;
+                let argregs = [
+                    RegisterARM64::X0,
+                    RegisterARM64::X1,
+                    RegisterARM64::X2,
+                    RegisterARM64::X3,
+                    RegisterARM64::X4,
+                    RegisterARM64::X5,
+                ];
+                for (k, r) in argregs.iter().enumerate() {
+                    uc.reg_write(*r, Rec::arg_base(k))?;
+                }
+            }
         }
 
         install_hooks(&mut uc)?;
 
         let cfg = self.cfg.clone();
         let run_res = uc.emu_start(start, RET_ADDR, cfg.timeout_us, cfg.instr_cap as usize);
-        let rip = uc.reg_read(RegisterX86::RIP).unwrap_or(0);
+        let rip = pc(&uc);
 
         let rec = uc.get_data_mut();
         if rec.instret >= cfg.instr_cap {
@@ -513,6 +548,10 @@ impl MicroExec {
 // decode-and-step-past-junk loop as static_calls.
 fn insn_starts(image: &Image, func: &Func) -> Vec<u64> {
     let mut out = Vec::new();
+    if image.arch == Isa::Aarch64 {
+        let n = func.size.min(1 << 20) / 4;
+        return (0..n).map(|i| func.entry.wrapping_add(i * 4)).collect();
+    }
     let Ok(cs) = Capstone::new()
         .x86()
         .mode(arch::x86::ArchMode::Mode64)
@@ -552,13 +591,6 @@ pub fn static_calls(
 ) -> (Vec<u64>, Vec<String>) {
     let mut callees: Vec<u64> = Vec::new();
     let mut names: Vec<String> = Vec::new();
-    let Ok(cs) = Capstone::new()
-        .x86()
-        .mode(arch::x86::ArchMode::Mode64)
-        .build()
-    else {
-        return (callees, names);
-    };
     let lo = func.entry;
     let hi = func.entry.saturating_add(func.size);
     // a crafted size can claim the whole image; a real function is far under this
@@ -571,6 +603,44 @@ pub fn static_calls(
         .map(|s| (s.vaddr, s.vaddr.saturating_add(s.bytes.len() as u64)))
         .collect();
     let in_image = |t: u64| segs.iter().any(|&(a, b)| t >= a && t < b);
+    if image.arch == Isa::Aarch64 {
+        // bl = call, b out of the body = tail call. both pc-relative imm26.
+        for (i, w) in code.chunks_exact(4).enumerate() {
+            let a = lo.wrapping_add((i * 4) as u64);
+            let w = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            let t = if w & 0xfc00_0000 == 0x9400_0000 {
+                Some(a64_rel(a, w & 0x03ff_ffff, 26))
+            } else if w & 0xfc00_0000 == 0x1400_0000 {
+                let t = a64_rel(a, w & 0x03ff_ffff, 26);
+                if t >= lo && t < hi {
+                    None
+                } else {
+                    Some(t)
+                }
+            } else {
+                None
+            };
+            if let Some(t) = t {
+                if let Some(n) = imports.get(&t) {
+                    names.push(n.clone());
+                } else if in_image(t) {
+                    callees.push(t);
+                }
+            }
+        }
+        callees.sort_unstable();
+        callees.dedup();
+        names.sort();
+        names.dedup();
+        return (callees, names);
+    }
+    let Ok(cs) = Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .build()
+    else {
+        return (callees, names);
+    };
     let mut off = 0usize;
     // capstone stops at the first byte it can't decode; step past it and keep
     // going so one odd byte (padding, data in text) doesn't hide the rest.
@@ -809,22 +879,22 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
                     0x5555_0000_0000_0000u64 ^ rec.ret_ctr.wrapping_mul(0x9e3779b97f4a7c15)
                 };
                 // skip the call entirely: callee never runs, stack stays balanced
-                let _ = uc.reg_write(RegisterX86::RAX, tag);
-                let _ = uc.reg_write(RegisterX86::RIP, addr.wrapping_add(ilen));
+                set_retval(uc, tag);
+                set_pc(uc, addr.wrapping_add(ilen));
             }
             Kind::Syscall => {
-                let nr = uc.reg_read(RegisterX86::RAX).unwrap_or(0) as u32;
+                let nr = syscall_nr(uc);
                 let tag = {
                     let rec = uc.get_data_mut();
                     rec.effects.push(Effect::Syscall(nr));
                     rec.ret_ctr += 1;
                     0x6666_0000_0000_0000u64 ^ rec.ret_ctr
                 };
-                let _ = uc.reg_write(RegisterX86::RAX, tag);
-                let _ = uc.reg_write(RegisterX86::RIP, addr.wrapping_add(ilen));
+                set_retval(uc, tag);
+                set_pc(uc, addr.wrapping_add(ilen));
             }
             Kind::Ret => {
-                let rax = uc.reg_read(RegisterX86::RAX).unwrap_or(0);
+                let rax = retval(uc);
                 let rec = uc.get_data_mut();
                 let vc = rec.classify_value(rax);
                 rec.effects.push(Effect::Ret(vc));
@@ -847,7 +917,7 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
                     (Some(dir), Some(t)) => {
                         // redirect to the chosen successor, skip the real jcc
                         let dest = if dir { t } else { addr.wrapping_add(ilen) };
-                        let _ = uc.reg_write(RegisterX86::RIP, dest);
+                        set_pc(uc, dest);
                     }
                     _ => {
                         // natural: remember the target so we can read the
@@ -863,9 +933,45 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
     Ok(())
 }
 
+// the per-isa register plumbing the code hook needs: where the pc, the return
+// value and the syscall number live.
+fn pc(uc: &Unicorn<Rec>) -> u64 {
+    match uc.get_data().isa {
+        Isa::X86_64 => uc.reg_read(RegisterX86::RIP).unwrap_or(0),
+        Isa::Aarch64 => uc.reg_read(RegisterARM64::PC).unwrap_or(0),
+    }
+}
+fn set_pc(uc: &mut Unicorn<Rec>, v: u64) {
+    let _ = match uc.get_data().isa {
+        Isa::X86_64 => uc.reg_write(RegisterX86::RIP, v),
+        Isa::Aarch64 => uc.reg_write(RegisterARM64::PC, v),
+    };
+}
+fn retval(uc: &Unicorn<Rec>) -> u64 {
+    match uc.get_data().isa {
+        Isa::X86_64 => uc.reg_read(RegisterX86::RAX).unwrap_or(0),
+        Isa::Aarch64 => uc.reg_read(RegisterARM64::X0).unwrap_or(0),
+    }
+}
+fn set_retval(uc: &mut Unicorn<Rec>, v: u64) {
+    let _ = match uc.get_data().isa {
+        Isa::X86_64 => uc.reg_write(RegisterX86::RAX, v),
+        Isa::Aarch64 => uc.reg_write(RegisterARM64::X0, v),
+    };
+}
+fn syscall_nr(uc: &Unicorn<Rec>) -> u32 {
+    match uc.get_data().isa {
+        Isa::X86_64 => uc.reg_read(RegisterX86::RAX).unwrap_or(0) as u32,
+        Isa::Aarch64 => uc.reg_read(RegisterARM64::X8).unwrap_or(0) as u32,
+    }
+}
+
 // decode just enough: what kind of instruction and how long.
 fn decode(rec: &Rec, addr: u64, buf: &[u8]) -> (Kind, u64) {
-    let insns = match rec.cs.disasm_count(buf, addr, 1) {
+    let Some(cs) = rec.cs.as_ref() else {
+        return decode_a64(addr, buf);
+    };
+    let insns = match cs.disasm_count(buf, addr, 1) {
         Ok(i) => i,
         Err(_) => return (Kind::Plain, 1),
     };
@@ -907,6 +1013,56 @@ fn decode(rec: &Rec, addr: u64, buf: &[u8]) -> (Kind, u64) {
         Kind::Plain
     };
     (kind, ilen)
+}
+
+// aarch64: fixed 4-byte words, the kinds we steer on are all top-bits patterns.
+//   bl imm26            1001 01ii ...           call, direct
+//   blr xn              1101 0110 0011 1111 0000 00nn nnn0 0000   call, indirect
+//   ret {xn}            1101 0110 0101 1111 0000 00nn nnn0 0000
+//   svc #imm            1101 0100 000i iiii iiii iiii iii0 0001
+//   b.cond imm19        0101 0100 iiii iiii iiii iiii iii0 cccc
+//   cbz/cbnz imm19      x011 010o iiii iiii iiii iiii iiit tttt
+//   tbz/tbnz imm14      x011 011o bbbb biii iiii iiii iiit tttt
+// an unconditional b is a jump, not a decision, so it is Plain here (the static
+// sweep treats one that leaves the body as a tail call).
+fn decode_a64(addr: u64, buf: &[u8]) -> (Kind, u64) {
+    if buf.len() < 4 {
+        return (Kind::Plain, 4);
+    }
+    let w = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let kind = if w & 0xfc00_0000 == 0x9400_0000 {
+        Kind::Call {
+            target: Some(a64_rel(addr, w & 0x03ff_ffff, 26)),
+            direct: true,
+        }
+    } else if w & 0xffff_fc1f == 0xd63f_0000 {
+        Kind::Call {
+            target: None,
+            direct: false,
+        }
+    } else if w & 0xffff_fc1f == 0xd65f_0000 {
+        Kind::Ret
+    } else if w & 0xffe0_001f == 0xd400_0001 {
+        Kind::Syscall
+    } else if w & 0xff00_0010 == 0x5400_0000 || w & 0x7e00_0000 == 0x3400_0000 {
+        Kind::Branch {
+            target: Some(a64_rel(addr, (w >> 5) & 0x7_ffff, 19)),
+        }
+    } else if w & 0x7e00_0000 == 0x3600_0000 {
+        Kind::Branch {
+            target: Some(a64_rel(addr, (w >> 5) & 0x3fff, 14)),
+        }
+    } else {
+        Kind::Plain
+    };
+    (kind, 4)
+}
+
+// pc-relative target from an aarch64 immediate of `bits` bits, in words
+fn a64_rel(addr: u64, imm: u32, bits: u32) -> u64 {
+    let shift = 64 - bits;
+    let off = ((imm as u64) << shift) as i64 >> shift; // sign extend
+    addr.wrapping_add((off as u64).wrapping_mul(4))
 }
 
 // taken-target of a conditional jump. handles the two common encodings:
@@ -1032,6 +1188,7 @@ mod tests {
             }],
             entry: 0x401000,
             is_pie: false,
+            arch: Isa::X86_64,
         }
     }
     fn f() -> Func {
@@ -1069,6 +1226,7 @@ mod tests {
             ],
             entry: 0x401000,
             is_pie: false,
+            arch: Isa::X86_64,
         };
         let func = Func {
             name: None,
@@ -1196,6 +1354,131 @@ mod tests {
                 Effect::Call(CallTarget::Sym(_)) | Effect::Syscall(_) | Effect::Capped
             )));
         }
+    }
+
+    fn img_a64(code: &[u8]) -> Image {
+        let mut i = img(code);
+        i.arch = Isa::Aarch64;
+        i
+    }
+
+    #[test]
+    fn a64_decode_kinds_and_targets() {
+        let le = |w: u32| w.to_le_bytes();
+        // bl +0x100 from 0x401000 -> 0x401100
+        assert!(matches!(
+            decode_a64(0x401000, &le(0x9400_0040)).0,
+            Kind::Call {
+                target: Some(0x401100),
+                direct: true
+            }
+        ));
+        // bl backwards: imm26 = -1 -> pc - 4
+        assert!(matches!(
+            decode_a64(0x401000, &le(0x97ff_ffff)).0,
+            Kind::Call {
+                target: Some(0x400ffc),
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode_a64(0, &le(0xd63f_0000)).0,
+            Kind::Call {
+                target: None,
+                direct: false
+            }
+        )); // blr x0
+        assert!(matches!(decode_a64(0, &le(0xd65f_03c0)).0, Kind::Ret)); // ret
+        assert!(matches!(decode_a64(0, &le(0xd400_0001)).0, Kind::Syscall)); // svc #0
+                                                                             // b.eq +8, cbz x0 +8, tbz x0 #0 +8 all branch to pc+8
+        for w in [0x5400_0040u32, 0xb400_0040, 0x3600_0040] {
+            assert!(
+                matches!(
+                    decode_a64(0x1000, &le(w)).0,
+                    Kind::Branch {
+                        target: Some(0x1008)
+                    }
+                ),
+                "{w:#x}"
+            );
+        }
+        // plain: add x0, x0, #1 ; unconditional b is plain too (a jump, not a decision)
+        assert!(matches!(decode_a64(0, &le(0x9100_0400)).0, Kind::Plain));
+        assert!(matches!(decode_a64(0, &le(0x1400_0002)).0, Kind::Plain));
+        assert_eq!(decode_a64(0, &le(0)).1, 4);
+    }
+
+    #[test]
+    fn a64_writes_arg0_and_returns_it() {
+        // str x1, [x0] ; mov x0, x1 ; ret   == the x86 test, other isa, same effects
+        let mut code = Vec::new();
+        code.extend_from_slice(&0xf900_0001u32.to_le_bytes());
+        code.extend_from_slice(&0xaa01_03e0u32.to_le_bytes());
+        code.extend_from_slice(&0xd65f_03c0u32.to_le_bytes());
+        let func = Func {
+            name: None,
+            entry: 0x401000,
+            size: code.len() as u64,
+            source: FuncSource::Symtab,
+        };
+        let t = MicroExec::new(Config::default()).run(
+            &img_a64(&code),
+            &func,
+            &Arc::new(HashMap::new()),
+        );
+        assert!(!t.capped, "{t:?}");
+        assert!(
+            t.effects.iter().any(|e| matches!(
+                e,
+                Effect::Write {
+                    region: Region::Arg(0),
+                    off: 0,
+                    val: ValueClass::Input(1)
+                }
+            )),
+            "{:?}",
+            t.effects
+        );
+        assert!(t
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::Ret(ValueClass::Input(1)))));
+        assert!(t.coverage > 0.9);
+    }
+
+    #[test]
+    fn a64_stubs_bl_and_records_callee_and_import() {
+        // bl 0x401100 (local) ; bl 0x401200 (import) ; ret
+        let mut code = Vec::new();
+        code.extend_from_slice(&0x9400_0040u32.to_le_bytes());
+        code.extend_from_slice(&0x9400_007fu32.to_le_bytes()); // 0x401004 + 0x7f*4 = 0x401200
+        code.extend_from_slice(&0xd65f_03c0u32.to_le_bytes());
+        // give the image a big enough body that both targets are in-image
+        let mut body = code.clone();
+        body.resize(0x300, 0);
+        let func = Func {
+            name: None,
+            entry: 0x401000,
+            size: code.len() as u64,
+            source: FuncSource::Symtab,
+        };
+        let mut imports = HashMap::new();
+        imports.insert(0x401200u64, "memcpy".to_string());
+        let image = img_a64(&body);
+        let t = MicroExec::new(Config::default()).run(&image, &func, &Arc::new(imports.clone()));
+        assert_eq!(t.callees, vec![0x401100], "{t:?}");
+        assert!(t
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::Call(CallTarget::Sym(n)) if n == "memcpy")));
+        assert!(t
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::Call(CallTarget::Anon))));
+        assert!(t.effects.iter().any(|e| matches!(e, Effect::Ret(_))));
+        let (callees, names) = static_calls(&image, &func, &imports);
+        assert_eq!(callees, vec![0x401100]);
+        assert_eq!(names, vec!["memcpy".to_string()]);
     }
 
     #[test]

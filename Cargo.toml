@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -24,13 +24,16 @@ goblin = "0.10"
 gimli = "0.34"
 capstone = "0.14"
 # no-JIT (TCI) unicorn fork: builds unicorn from source with the tiny code
-# interpreter (no host codegen -> no executable page needed) and x86-only TCG.
+# interpreter (no host codegen -> no executable page needed), x86-64 + aarch64 TCG only.
 # this is what lets the seccomp jail forbid PROT_EXEC outright (see SECURITY.md).
 # the fork always builds from source, so unlike the stock crate it never links an
 # ambient system libunicorn, and both the exec-free guarantee and the arch trim
 # actually apply. published as unicorn-engine-tci + unicorn-engine-sys-tci
-# (GPL-2.0) from github.com/1rhino2/unicorn-tci, pinned to 2.1.5.
-unicorn-engine = { package = "unicorn-engine-tci", version = "=2.1.5", default-features = false, features = ["arch_x86"] }
+# (GPL-2.0) from github.com/1rhino2/unicorn-tci. 2.1.6 adds the per-arch
+# tcg_qemu_tb_exec rename that a two-arch build needs; until it is on crates.io
+# this pins the fork's v2.1.6 tag. switch back to `version = "=2.1.6"` once
+# `cargo publish` has run for both crates.
+unicorn-engine = { package = "unicorn-engine-tci", version = "2.1.6", git = "https://github.com/1rhino2/unicorn-tci", tag = "v2.1.6", default-features = false, features = ["arch_x86", "arch_aarch64"] }
 # serialize gives sqlite3_deserialize, used to parse a corpus .db entirely in
 # memory inside the jailed worker (no file open), see fnprint-db::Db::open_image.
 rusqlite = { version = "0.37", features = ["bundled", "serialize"] }
@@ -72,3 +75,4 @@ todo = "deny"
 unimplemented = "deny"
 unreachable = "deny"
 mem_forget = "deny"
+

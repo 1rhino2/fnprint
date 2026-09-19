@@ -42,3 +42,6 @@ allow = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# our own unicorn fork, pinned to a tag until 2.1.6 is on crates.io (see the
+# workspace Cargo.toml). the only git source allowed.
+allow-git = ["https://github.com/1rhino2/unicorn-tci"]

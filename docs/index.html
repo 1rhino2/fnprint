@@ -74,7 +74,7 @@
 <header>
   <h1>fnprint</h1>
   <div class="tag">behavioral function fingerprinting</div>
-  <p class="sub">Name functions in stripped x86-64 ELF binaries by what they do, not their bytes. Built for n-day triage when the builds don't line up.</p>
+  <p class="sub">Name functions in stripped ELF binaries by what they do, not their bytes. x86-64 and aarch64, across compilers, optimization levels and CPUs. Built for n-day triage when the builds don't line up, safe to point at malware.</p>
   <div class="cta">
     <div class="install mono"><span class="p">$</span> cargo install fnprint</div>
   </div>
@@ -104,8 +104,8 @@
       <p>Give it a vuln build and a patched build. It ranks which functions in an unknown target lean vulnerable, so you open the right ones first.</p>
     </div>
     <div class="card">
-      <h3>survives recompiles</h3>
-      <p>It compares behavior, so a compiler swap or an optimization-level gap that wrecks a CFG diff (bindiff, diaphora) matters much less here.</p>
+      <h3>survives recompiles, and CPUs</h3>
+      <p>It compares behavior, so a compiler swap or an optimization-level gap that wrecks a CFG diff (bindiff, diaphora) matters much less here. Index the x86-64 build, name the aarch64 firmware: zlib -O0, 42 named, 42 right.</p>
     </div>
     <div class="card">
       <h3>runs untrusted code safely</h3>
@@ -116,7 +116,7 @@
 
 <section>
   <h2>how it works</h2>
-  <p>fnprint microexecutes each function on a no-JIT unicorn fork, records the effects it produces (memory reads and writes, calls, syscalls, return behavior), and turns that effect trace into a MinHash/LSH fingerprint. Matching is behavioral similarity between fingerprints, not byte or structure matching. The emulated code never runs with executable memory and never leaves a locked-down worker process.</p>
+  <p>fnprint microexecutes each function on a no-JIT unicorn fork, records the effects it produces (memory reads and writes, calls, syscalls, return behavior), and turns that effect trace into a MinHash/LSH fingerprint. Naming and diffing are a global 1:1 alignment of the two function sets, rescored with the call graph, so two behavioral twins get told apart by who calls them. The emulated code never runs with executable memory and never leaves a locked-down worker process.</p>
 </section>
 
 <section>
@@ -138,14 +138,14 @@ review queue (vuln-leaning, strongest first):
   <h2>what it is bad at</h2>
   <ul class="plain">
     <li>Pure-compute functions with thin behavior (checksums, hashes) collide. crc32_big matching adler32_z above is the documented weak spot.</li>
-    <li>x86-64 ELF only right now.</li>
+    <li>x86-64 and aarch64 ELF. No PE or Mach-O yet.</li>
     <li>It ranks and names, it does not replace the RE. The value is deciding what to open first when builds don't match, which is most real 1-day work.</li>
   </ul>
 </section>
 
 <footer>
   <div class="wrap" style="padding:0">
-    <span class="mono">Rust  .  MIT  .  x86-64 ELF</span><br><br>
+    <span class="mono">Rust  .  MIT  .  x86-64 + aarch64 ELF</span><br><br>
     <a href="https://github.com/1rhino2/fnprint">github.com/1rhino2/fnprint</a>
   </div>
 </footer>

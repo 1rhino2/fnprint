@@ -11,6 +11,11 @@ emulator are written to treat every field in a file as attacker-controlled.
 - The goal is that no input, however crafted, makes fnprint panic, hang, or run
   the machine out of memory. Malformed input degrades to an error or a partial
   result.
+- Two guest ISAs are compiled into the emulator (x86-64 and aarch64, the
+  unicorn build is trimmed to those). The loader picks one from `e_machine`
+  and refuses anything else, so the aarch64 frontend only ever sees an
+  aarch64 image. Function discovery merges `.eh_frame` with the symbol tables;
+  both are attacker bytes and both stay under the same count caps.
 - Micro-executed code runs inside unicorn with instruction, visit, time, and
   effect caps. It is emulated, not run natively, and it is bounded. unicorn is
   built no-JIT (the TCG tiny code interpreter, `CONFIG_TCG_INTERPRETER`): guest

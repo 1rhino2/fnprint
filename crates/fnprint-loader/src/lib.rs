@@ -1,7 +1,7 @@
 //! Load an ELF, hand back the loadable segments and a best-effort list of
-//! functions. x86-64 only for now (v0.1). We try symbols first, fall back to
-//! .eh_frame FDE ranges when the thing is stripped, which covers most release
-//! binaries since they keep unwind info even without a symtab.
+//! functions. x86-64 and aarch64. We try symbols first, fall back to .eh_frame
+//! FDE ranges when the thing is stripped, which covers most release binaries
+//! since they keep unwind info even without a symtab.
 
 use std::collections::HashMap;
 
@@ -32,10 +32,29 @@ pub enum FuncSource {
     EhFrame,
 }
 
+/// the instruction set the image is for. everything downstream of the loader
+/// that touches machine code (the emulator, the static call sweep) keys on it;
+/// the effect model and the matcher never see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Arch {
+    X86_64,
+    Aarch64,
+}
+
+impl Arch {
+    pub fn name(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "x86-64",
+            Arch::Aarch64 => "aarch64",
+        }
+    }
+}
+
 pub struct Image {
     pub segments: Vec<Segment>,
     pub entry: u64,
     pub is_pie: bool,
+    pub arch: Arch,
 }
 
 impl Image {
@@ -92,12 +111,11 @@ const MAX_LOAD_SEGS: usize = 256;
 
 pub fn load(bytes: &[u8]) -> Result<Loaded> {
     let elf = Elf::parse(bytes).context("not a valid elf")?;
-    if elf.header.e_machine != goblin::elf::header::EM_X86_64 {
-        bail!(
-            "only x86-64 is supported in this version (got e_machine {})",
-            elf.header.e_machine
-        );
-    }
+    let arch = match elf.header.e_machine {
+        goblin::elf::header::EM_X86_64 => Arch::X86_64,
+        goblin::elf::header::EM_AARCH64 => Arch::Aarch64,
+        m => bail!("only x86-64 and aarch64 are supported (got e_machine {m})"),
+    };
 
     // first pass: validate every PT_LOAD and sum what it WILL allocate, WITHOUT
     // allocating anything yet. the total-memory guard has to count the actual
@@ -199,7 +217,7 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
     let is_pie = elf.header.e_type == goblin::elf::header::ET_DYN;
 
     let mut funcs = discover(&elf, bytes)?;
-    let imports = plt_imports(&elf, bytes);
+    let imports = plt_imports(&elf, bytes, arch);
     // sort + dedup by entry, prefer named entries
     funcs.sort_by(|a, b| {
         a.entry
@@ -213,6 +231,7 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
             segments,
             entry: elf.header.e_entry,
             is_pie,
+            arch,
         },
         funcs,
         imports,
@@ -271,10 +290,32 @@ fn discover(elf: &Elf, raw: &[u8]) -> Result<Vec<Func>> {
         });
     }
 
-    // stripped? lean on unwind info.
-    if out.is_empty() {
-        if let Some(mut fdes) = eh_frame_funcs(elf, raw) {
-            out.append(&mut fdes);
+    // unwind info covers what the symbols did not. a `strip --strip-all` .so
+    // keeps its dynsym (the exports) but loses every static function, and those
+    // are most of the interesting ones (inflate_fast, deflate_stored...). so
+    // always merge the FDEs, not just when there are no symbols at all. the
+    // plt has an FDE too; skip that range, its stubs are not functions.
+    if let Some(fdes) = eh_frame_funcs(elf, raw) {
+        let known: std::collections::HashSet<u64> = out.iter().map(|f| f.entry).collect();
+        let plt: Vec<(u64, u64)> = elf
+            .section_headers
+            .iter()
+            .filter(|sh| {
+                matches!(
+                    elf.shdr_strtab.get_at(sh.sh_name),
+                    Some(".plt") | Some(".plt.sec") | Some(".plt.got")
+                )
+            })
+            .map(|sh| (sh.sh_addr, sh.sh_addr.saturating_add(sh.sh_size)))
+            .collect();
+        for f in fdes {
+            if out.len() >= MAX_FUNCS {
+                break;
+            }
+            if known.contains(&f.entry) || plt.iter().any(|&(a, b)| f.entry >= a && f.entry < b) {
+                continue;
+            }
+            out.push(f);
         }
     }
 
@@ -286,7 +327,7 @@ fn discover(elf: &Elf, raw: &[u8]) -> Result<Vec<Func>> {
 // `jmp [rip+disp32]` that goes through a known slot. keyed by stub address AND
 // slot address, the two never collide (different sections). plt0 (the lazy
 // resolver) jumps through GOT[2] which has no reloc, so it drops out on its own.
-fn plt_imports(elf: &Elf, raw: &[u8]) -> HashMap<u64, String> {
+fn plt_imports(elf: &Elf, raw: &[u8], arch: Arch) -> HashMap<u64, String> {
     let mut out: HashMap<u64, String> = HashMap::new();
     for r in elf
         .pltrelocs
@@ -332,16 +373,22 @@ fn plt_imports(elf: &Elf, raw: &[u8]) -> HashMap<u64, String> {
         let mut off = 0usize;
         while off + 16 <= data.len() && stubs.len() < MAX_FUNCS {
             let stub = &data[off..off + 16];
-            if let Some(at) = find_jmp_rip(stub) {
-                let disp =
-                    i32::from_le_bytes([stub[at + 2], stub[at + 3], stub[at + 4], stub[at + 5]])
-                        as i64;
-                let stub_addr = sh.sh_addr.wrapping_add(off as u64);
-                let next = stub_addr.wrapping_add(at as u64 + 6);
-                let slot = next.wrapping_add(disp as u64);
-                if let Some(n) = out.get(&slot) {
-                    stubs.push((stub_addr, n.clone()));
-                }
+            let stub_addr = sh.sh_addr.wrapping_add(off as u64);
+            let slot = match arch {
+                Arch::X86_64 => find_jmp_rip(stub).map(|at| {
+                    let disp = i32::from_le_bytes([
+                        stub[at + 2],
+                        stub[at + 3],
+                        stub[at + 4],
+                        stub[at + 5],
+                    ]) as i64;
+                    let next = stub_addr.wrapping_add(at as u64 + 6);
+                    next.wrapping_add(disp as u64)
+                }),
+                Arch::Aarch64 => aarch64_plt_slot(stub, stub_addr),
+            };
+            if let Some(n) = slot.and_then(|s| out.get(&s)) {
+                stubs.push((stub_addr, n.clone()));
             }
             off += 16;
         }
@@ -365,6 +412,31 @@ fn find_jmp_rip(stub: &[u8]) -> Option<usize> {
     } else {
         None
     }
+}
+
+// the got slot an aarch64 plt stub loads through. a stub is
+//   adrp x16, page ; ldr x17, [x16, #lo12] ; add x16, x16, #lo12 ; br x17
+// so the slot is the adrp page plus the ldr's scaled imm12. plt0 (32 bytes,
+// the lazy resolver) never decodes as adrp+ldr in its first 8 bytes, and the
+// 16-byte stride puts the real stubs on the right boundary after it.
+fn aarch64_plt_slot(stub: &[u8], stub_addr: u64) -> Option<u64> {
+    let w0 = u32::from_le_bytes([stub[0], stub[1], stub[2], stub[3]]);
+    let w1 = u32::from_le_bytes([stub[4], stub[5], stub[6], stub[7]]);
+    // adrp: 1 immlo(2) 10000 immhi(19) rd(5)
+    if w0 & 0x9f00_0000 != 0x9000_0000 {
+        return None;
+    }
+    let immlo = ((w0 >> 29) & 0x3) as u64;
+    let immhi = ((w0 >> 5) & 0x7_ffff) as u64;
+    let imm = (immhi << 2) | immlo; // 21 bits, signed
+    let imm = ((imm << 43) as i64 >> 43) as u64; // sign extend
+    let page = (stub_addr & !0xfff).wrapping_add(imm << 12);
+    // ldr xt, [xn, #imm12*8]: 11 111 0 01 01 imm12 rn rt
+    if w1 & 0xffc0_0000 != 0xf940_0000 {
+        return None;
+    }
+    let imm12 = ((w1 >> 10) & 0xfff) as u64;
+    Some(page.wrapping_add(imm12 * 8))
 }
 
 // pull function start+length out of every FDE in .eh_frame.
@@ -424,6 +496,40 @@ fn eh_frame_funcs(elf: &Elf, raw: &[u8]) -> Option<Vec<Func>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aarch64_plt_stub_resolves_its_got_slot() {
+        // a real-shaped stub at 0x10640:
+        //   adrp x16, 0x20000        (page +0x10000 from 0x10000)
+        //   ldr  x17, [x16, #0x18]
+        //   add  x16, x16, #0x18
+        //   br   x17
+        let stub_addr = 0x10640u64;
+        // adrp: immhi:immlo = 0x10 pages -> immlo = 0, immhi = 4
+        let adrp: u32 = 0x9000_0000 | (4 << 5) | 16;
+        let ldr: u32 = 0xf940_0000 | (3 << 10) | (16 << 5) | 17; // imm12 = 3 -> +0x18
+        let mut stub = Vec::new();
+        stub.extend_from_slice(&adrp.to_le_bytes());
+        stub.extend_from_slice(&ldr.to_le_bytes());
+        stub.extend_from_slice(&0x9100_6210u32.to_le_bytes());
+        stub.extend_from_slice(&0xd61f_0220u32.to_le_bytes());
+        assert_eq!(aarch64_plt_slot(&stub, stub_addr), Some(0x20018));
+        // negative page offset
+        let adrp_neg: u32 = 0x9000_0000 | (0x7_ffff << 5) | 16; // immhi all ones, immlo 0 -> -4 pages
+        stub[..4].copy_from_slice(&adrp_neg.to_le_bytes());
+        assert_eq!(
+            aarch64_plt_slot(&stub, stub_addr),
+            Some(0x10000 - 0x4000 + 0x18)
+        );
+        // plt0 shape (stp first) is not a stub
+        assert_eq!(
+            aarch64_plt_slot(
+                &[0xf0, 0x7b, 0xbf, 0xa9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                0
+            ),
+            None
+        );
+    }
 
     #[test]
     fn garbage_input_errors_not_panics() {
@@ -657,6 +763,7 @@ mod tests {
             }],
             entry: 0,
             is_pie: false,
+            arch: Arch::X86_64,
         };
         assert!(img.code_at(u64::MAX - 4, 64).is_none());
         assert!(img.code_at(u64::MAX, 16).is_none());
