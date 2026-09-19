@@ -15,7 +15,7 @@ jobs:
         # fork; a system libunicorn in the image would let an accidental switch to a
         # dynamic/system link succeed silently and reintroduce the JIT code buffer.
         # with no system lib present, any such regression fails the build loudly.
-        run: sudo apt-get update && sudo apt-get install -y cmake
+        run: sudo apt-get update && sudo apt-get install -y cmake gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
