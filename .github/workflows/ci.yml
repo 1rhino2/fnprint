@@ -44,7 +44,7 @@ jobs:
           # every smoke function has a twin and they behave the same, so the
           # x86 -> arm rank-1 must be perfect or the port has regressed
           grep -q 'rank-1 accuracy: 100.0%' /tmp/xarch.txt
-          cp /tmp/sarm.so /tmp/sarm_stripped.so && strip --strip-all /tmp/sarm_stripped.so
+          cp /tmp/sarm.so /tmp/sarm_stripped.so && aarch64-linux-gnu-strip --strip-all /tmp/sarm_stripped.so
           ./target/release/fnprint index /tmp/sa.so -o /tmp/sa.db
           ./target/release/fnprint query /tmp/sarm_stripped.so --corpus /tmp/sa.db --threshold 0.7 | tee /tmp/xq.txt
           grep -q 'named' /tmp/xq.txt
