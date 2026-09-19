@@ -4,7 +4,7 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
-fp="$root/target/release/fnprint"
+fp="${CARGO_TARGET_DIR:-$root/target}/release/fnprint"
 work="${1:-$here/work}"
 [ -x "$fp" ] || { echo "build first: cargo build --release"; exit 1; }
 bash "$here/build_zlib.sh" "$work"

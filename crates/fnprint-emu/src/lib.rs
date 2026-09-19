@@ -41,6 +41,16 @@ const MAX_RUNTIME_MAPS: usize = 256;
 /// is far above legit need; exceeding it means a pathological layout, and we fail
 /// the run closed (capped trace) rather than march toward qemu's region cap.
 const MAX_SETUP_RUNS: usize = 64;
+/// default blanket restarts per seed: off. measured on the bench with the
+/// restart effects filtered to import calls + syscalls (the least build-specific
+/// slice): gcc O2->O3 aligned acc 63 -> 68, but gcc/clang O3 92.6 -> 61.1 and
+/// gcc O0->O2 93 -> 82, because a restart at -O0 runs helpers that -O3 inlined
+/// away and the union print drifts. it needs to be a second print with its own
+/// similarity, not a union with the entry print. FNPRINT_BLANKET=N turns it on.
+pub const BLANKET_RESTARTS: usize = 0;
+/// stop restarting once this much of the body has executed; the rest is
+/// padding, unreachable tails, or not worth another run.
+const BLANKET_ENOUGH: f32 = 0.9;
 
 #[derive(Clone)]
 pub struct Config {
@@ -65,6 +75,12 @@ pub struct Config {
     /// paths add build-specific noise that hurts cross-build matching. see the
     /// roadmap notes on concolic-lite before turning this up.
     pub explore_depth: usize,
+    /// blanket execution: after the natural run, restart at the lowest
+    /// instruction of the body nothing executed yet, with fresh state, and
+    /// union what that run does. repeat up to this many times per seed. this
+    /// is what gets past an input-validation gate that junk input fails: the
+    /// code behind it still runs, just from a fresh start. 0 = entry only.
+    pub blanket_restarts: usize,
 }
 
 impl Default for Config {
@@ -77,6 +93,7 @@ impl Default for Config {
             max_heapish: 24,
             max_effects: 96,
             explore_depth: 0,
+            blanket_restarts: BLANKET_RESTARTS,
         }
     }
 }
@@ -84,6 +101,10 @@ impl Default for Config {
 pub struct MicroExec {
     cfg: Config,
 }
+
+// one run's output: the trace, the natural branch directions (for path
+// exploration), and the body instructions executed (addr -> len, for blanket)
+type RunOut = (EffectTrace, Vec<bool>, HashMap<u64, u64>);
 
 // everything the hooks need lives here so unicorn can hand it back via get_data.
 struct Rec {
@@ -119,6 +140,8 @@ struct Rec {
     func_lo: u64,
     func_hi: u64,
     covered_bytes: u64,
+    // body instruction addr -> length, for blanket restart selection
+    covered: HashMap<u64, u64>,
     // direct call targets inside the image that are not imports. the call-graph
     // edges for the matcher, kept out of the effect tokens.
     callees: HashSet<u64>,
@@ -259,11 +282,18 @@ impl MicroExec {
         seeds: &[u64],
     ) -> Vec<EffectTrace> {
         let mut out = Vec::new();
+        // instruction starts of the body, for picking blanket restart points.
+        // computed once, only if blanket is on.
+        let starts: Vec<u64> = if self.cfg.blanket_restarts > 0 {
+            insn_starts(image, func)
+        } else {
+            Vec::new()
+        };
         for &sd in seeds {
             let mut cfg = self.cfg.clone();
             cfg.seed = sd;
             let ex = MicroExec { cfg };
-            let (base, dirs) = ex.run_forced(image, func, symbols, &[]);
+            let (base, dirs, mut covered) = ex.run_from(image, func, symbols, &[], func.entry);
             out.push(base);
             let depth = dirs.len().min(ex.cfg.explore_depth);
             for i in 0..depth {
@@ -271,6 +301,42 @@ impl MicroExec {
                 let mut plan = dirs[..i].to_vec();
                 plan.push(!dirs[i]);
                 out.push(ex.run_forced(image, func, symbols, &plan).0);
+            }
+            // blanket: restart at the first instruction nobody executed yet.
+            // the union of covered addresses is the stopping rule, and every
+            // restart trace reports the cumulative coverage so the caller's max
+            // is the blanket figure, not the entry run's.
+            let body: u64 = func.size.max(1);
+            for _ in 0..ex.cfg.blanket_restarts {
+                let covered_bytes: u64 = covered.values().sum();
+                if covered_bytes as f32 / body as f32 >= BLANKET_ENOUGH {
+                    break;
+                }
+                let Some(&at) = starts.iter().find(|a| !covered.contains_key(a)) else {
+                    break;
+                };
+                let (mut t, _, more) = ex.run_from(image, func, symbols, &[], at);
+                let before = covered.len();
+                covered.extend(more);
+                if covered.len() == before {
+                    // ran nothing new (bad restart point, decode error): move
+                    // on past it rather than spin on the same address.
+                    covered.insert(at, 0);
+                }
+                let covered_bytes: u64 = covered.values().sum();
+                t.coverage = (covered_bytes as f32 / body as f32).clamp(0.0, 1.0);
+                // a restart begins with whatever was in the registers, which is
+                // nothing like the real mid-function state and differs by build
+                // (register allocation), so its memory offsets are noise. calls
+                // and syscalls are the part that survives: keep those, drop the
+                // rest. tried keeping everything: rank-1 on the bench halved.
+                t.effects.retain(|e| {
+                    matches!(
+                        e,
+                        Effect::Call(CallTarget::Sym(_)) | Effect::Syscall(_) | Effect::Capped
+                    )
+                });
+                out.push(t);
             }
         }
         out
@@ -283,7 +349,22 @@ impl MicroExec {
         symbols: &Arc<HashMap<u64, String>>,
         force: &[bool],
     ) -> (EffectTrace, Vec<bool>) {
-        match self.try_run(image, func, symbols, force) {
+        let (t, d, _) = self.run_from(image, func, symbols, force, func.entry);
+        (t, d)
+    }
+
+    // one run starting at `start` (the entry, or a blanket restart point). also
+    // hands back the body instructions it executed (addr -> length) so the
+    // caller can pick the next restart.
+    fn run_from(
+        &self,
+        image: &Image,
+        func: &Func,
+        symbols: &Arc<HashMap<u64, String>>,
+        force: &[bool],
+        start: u64,
+    ) -> RunOut {
+        match self.try_run(image, func, symbols, force, start) {
             Ok(x) => x,
             // a run that blew up is still a (short, capped) signature, not a crash
             Err(_) => (
@@ -295,6 +376,7 @@ impl MicroExec {
                     callees: Vec::new(),
                 },
                 Vec::new(),
+                HashMap::new(),
             ),
         }
     }
@@ -305,7 +387,8 @@ impl MicroExec {
         func: &Func,
         symbols: &Arc<HashMap<u64, String>>,
         force: &[bool],
-    ) -> Result<(EffectTrace, Vec<bool>), unicorn_engine::uc_error> {
+        start: u64,
+    ) -> Result<RunOut, unicorn_engine::uc_error> {
         let cs = Capstone::new()
             .x86()
             .mode(arch::x86::ArchMode::Mode64)
@@ -338,6 +421,7 @@ impl MicroExec {
             func_lo: func.entry,
             func_hi: func.entry.saturating_add(func.size),
             covered_bytes: 0,
+            covered: HashMap::new(),
             callees: HashSet::new(),
         };
 
@@ -377,7 +461,7 @@ impl MicroExec {
         install_hooks(&mut uc)?;
 
         let cfg = self.cfg.clone();
-        let run_res = uc.emu_start(func.entry, RET_ADDR, cfg.timeout_us, cfg.instr_cap as usize);
+        let run_res = uc.emu_start(start, RET_ADDR, cfg.timeout_us, cfg.instr_cap as usize);
         let rip = uc.reg_read(RegisterX86::RIP).unwrap_or(0);
 
         let rec = uc.get_data_mut();
@@ -410,6 +494,7 @@ impl MicroExec {
         }
         let mut callees: Vec<u64> = rec.callees.iter().copied().collect();
         callees.sort_unstable();
+        let covered = std::mem::take(&mut rec.covered);
         Ok((
             EffectTrace {
                 effects,
@@ -419,8 +504,39 @@ impl MicroExec {
                 callees,
             },
             dirs,
+            covered,
         ))
     }
+}
+
+// instruction start addresses of a function body, linear sweep, sorted. same
+// decode-and-step-past-junk loop as static_calls.
+fn insn_starts(image: &Image, func: &Func) -> Vec<u64> {
+    let mut out = Vec::new();
+    let Ok(cs) = Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .build()
+    else {
+        return out;
+    };
+    let lo = func.entry;
+    let Some(code) = image.code_at(lo, func.size.min(1 << 20) as usize) else {
+        return out;
+    };
+    let mut off = 0usize;
+    while off < code.len() {
+        let Ok(insns) = cs.disasm_all(&code[off..], lo + off as u64) else {
+            break;
+        };
+        let mut advanced = 0usize;
+        for insn in insns.iter() {
+            out.push(insn.address());
+            advanced += insn.bytes().len();
+        }
+        off += advanced.max(1);
+    }
+    out
 }
 
 /// the static call graph of one function: every direct `call` target inside the
@@ -667,6 +783,7 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
             let first_visit = rec.visits.get(&addr).copied() == Some(1);
             if first_visit && addr >= rec.func_lo && addr < rec.func_hi {
                 rec.covered_bytes = rec.covered_bytes.saturating_add(ilen);
+                rec.covered.insert(addr, ilen);
             }
         }
 
@@ -1025,6 +1142,60 @@ mod tests {
         let t =
             MicroExec::new(Config::default()).run(&img(&code), &func, &Arc::new(HashMap::new()));
         assert!(t.coverage > 0.9, "coverage should be ~full: {}", t.coverage);
+    }
+
+    #[test]
+    fn blanket_restart_reaches_code_behind_a_guard() {
+        // test rdi,rdi ; jz +6 ; ret ; (dead on our input:) call 0x401100 ; ret
+        // wait, rdi is a seeded pointer so the jz is NOT taken and we ret at
+        // once. the call sits behind the early return and the entry run never
+        // reaches it. a blanket restart starts at the first unexecuted
+        // instruction (the call) and runs it, so the import shows up in the
+        // union and coverage climbs.
+        //   401000: 48 85 ff        test rdi,rdi
+        //   401003: 74 01           jz  401006
+        //   401005: c3              ret
+        //   401006: e8 f5 00 00 00  call 401100   (rel = 0x401100 - 0x40100b)
+        //   40100b: c3              ret
+        let code = [
+            0x48, 0x85, 0xff, 0x74, 0x01, 0xc3, 0xe8, 0xf5, 0x00, 0x00, 0x00, 0xc3,
+        ];
+        let func = Func {
+            name: None,
+            entry: 0x401000,
+            size: code.len() as u64,
+            source: FuncSource::Symtab,
+        };
+        let mut syms = HashMap::new();
+        syms.insert(0x401100u64, "hidden_call".to_string());
+        let syms = Arc::new(syms);
+        let off = MicroExec::new(Config {
+            blanket_restarts: 0,
+            ..Config::default()
+        })
+        .run_explore(&img(&code), &func, &syms, &[0]);
+        assert_eq!(off.len(), 1);
+        assert!(!off[0].effects.iter().any(|e| matches!(e, Effect::Call(_))));
+        let on = MicroExec::new(Config {
+            blanket_restarts: 4,
+            ..Config::default()
+        })
+        .run_explore(&img(&code), &func, &syms, &[0]);
+        assert!(on.len() >= 2, "expected a restart trace: {}", on.len());
+        let named = on
+            .iter()
+            .flat_map(|t| &t.effects)
+            .any(|e| matches!(e, Effect::Call(CallTarget::Sym(n)) if n == "hidden_call"));
+        assert!(named, "restart should reach the guarded call: {:?}", on);
+        let cov = on.iter().map(|t| t.coverage).fold(0.0f32, f32::max);
+        assert!(cov > 0.9, "blanket coverage should be ~full: {cov}");
+        // restart traces carry calls only, never the junk memory shape
+        for t in &on[1..] {
+            assert!(t.effects.iter().all(|e| matches!(
+                e,
+                Effect::Call(CallTarget::Sym(_)) | Effect::Syscall(_) | Effect::Capped
+            )));
+        }
     }
 
     #[test]

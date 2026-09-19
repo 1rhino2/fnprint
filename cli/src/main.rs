@@ -345,14 +345,14 @@ fn worker_main(op: &str, func: Option<&str>) -> Result<()> {
         "index" => {
             // func carries the shard as "idx/count" (absent -> whole binary).
             let (idx, cnt) = parse_shard(func);
-            match index_bytes_shard(&input, Config::default(), idx, cnt) {
+            match index_bytes_shard(&input, emu_config(), idx, cnt) {
                 Ok(funcs) => WorkerReply::IndexOk(funcs),
                 Err(e) => WorkerReply::Err(format!("{e:#}")),
             }
         }
         "dump" => {
             let name = func.unwrap_or_default();
-            match dump_traces(&input, name, Config::default()) {
+            match dump_traces(&input, name, emu_config()) {
                 Ok(traces) => WorkerReply::DumpOk(render_traces(&traces)),
                 Err(e) => WorkerReply::Err(format!("{e:#}")),
             }
@@ -415,6 +415,9 @@ fn run_worker(op: &str, func: Option<&str>, input: Arc<Vec<u8>>) -> Result<Worke
     // proxy/locale/tmpdir settings, anything the caller exported) is ambient
     // authority the jailed parser shouldn't get to read or act on. clear it all.
     cmd.env_clear();
+    // the one knob the worker takes from us, passed explicitly (never the raw
+    // environment): the blanket restart count, already parsed and clamped.
+    cmd.env("FNPRINT_BLANKET", emu_config().blanket_restarts.to_string());
     cmd.arg(WORKER_TOKEN).arg(op);
     if let Some(f) = func {
         cmd.arg(f);
@@ -554,6 +557,18 @@ fn parse_shard(spec: Option<&str>) -> (usize, usize) {
 // eats the gain (measured: neutral on small, ~0.8x on a mid-size lib). it only
 // pays off on large, function-rich corpora, so the default stays single-process
 // (identical to pre-0.4.0). set FNPRINT_SHARDS=N to shard a big index.
+// emulator config for this process. blanket restarts are off unless asked for
+// (see fnprint_emu::BLANKET_RESTARTS for why), FNPRINT_BLANKET=N turns them on.
+fn emu_config() -> Config {
+    let mut cfg = Config::default();
+    if let Ok(v) = std::env::var("FNPRINT_BLANKET") {
+        if let Ok(n) = v.parse::<usize>() {
+            cfg.blanket_restarts = n.min(16);
+        }
+    }
+    cfg
+}
+
 fn shard_count() -> usize {
     if let Ok(v) = std::env::var("FNPRINT_SHARDS") {
         if let Ok(n) = v.parse::<usize>() {
@@ -596,7 +611,7 @@ fn clamp_shards_for_input(requested: usize, input_len: u64) -> usize {
 fn run_index(bytes: &[u8], no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
     if no_sandbox {
         eprintln!("warning: --no-sandbox, running the emulator without the jail");
-        return index_bytes(bytes, Config::default());
+        return index_bytes(bytes, emu_config());
     }
     let requested = shard_count();
     let n = clamp_shards_for_input(requested, bytes.len() as u64);
@@ -713,7 +728,7 @@ fn validate_reply_fps(funcs: &[IndexedFunc]) -> Result<()> {
 fn run_dump(bytes: &[u8], func: &str, no_sandbox: bool) -> Result<Vec<String>> {
     if no_sandbox {
         eprintln!("warning: --no-sandbox, running the emulator without the jail");
-        return Ok(render_traces(&dump_traces(bytes, func, Config::default())?));
+        return Ok(render_traces(&dump_traces(bytes, func, emu_config())?));
     }
     match run_worker("dump", Some(func), Arc::new(bytes.to_vec()))? {
         WorkerReply::DumpOk(lines) => Ok(lines),
