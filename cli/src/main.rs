@@ -861,6 +861,7 @@ fn load_index(path: &str, no_sandbox: bool) -> Result<Vec<IndexedFunc>> {
                 // a .db target was indexed earlier and never stored coverage, so
                 // we can't re-derive it. assume covered rather than gate a corpus.
                 coverage: 1.0,
+                callees: r.callees,
             })
             .collect())
     } else {
@@ -907,6 +908,7 @@ fn cmd_index(binary: &str, out: Option<&str>, no_sandbox: bool, fmt: Format) -> 
                 entry: f.entry,
                 source: source_str(f.source),
                 fp: &f.fp,
+                callees: &f.callees,
             })
             .collect();
         db.insert_all(label, &prints)?;

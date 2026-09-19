@@ -119,6 +119,9 @@ struct Rec {
     func_lo: u64,
     func_hi: u64,
     covered_bytes: u64,
+    // direct call targets inside the image that are not imports. the call-graph
+    // edges for the matcher, kept out of the effect tokens.
+    callees: HashSet<u64>,
     // total mem-hook callbacks (reads + writes) this run. a single rep-prefixed
     // string op is ONE instruction (so instr_cap/visit_cap count it once) but
     // fires a mem hook per iteration with RCX seeded huge. the write side is
@@ -213,10 +216,17 @@ impl Rec {
 
 // what an instruction is, decoded just enough to steer the run
 enum Kind {
-    Call { target: Option<u64> },
+    /// target: the direct call destination, or for `call [rip+disp]` the got
+    /// slot it reads. direct says which, so only real e8 targets become callees.
+    Call {
+        target: Option<u64>,
+        direct: bool,
+    },
     Ret,
     Syscall,
-    Branch { target: Option<u64> },
+    Branch {
+        target: Option<u64>,
+    },
     Plain,
 }
 
@@ -282,6 +292,7 @@ impl MicroExec {
                     instret: 0,
                     capped: true,
                     coverage: 0.0,
+                    callees: Vec::new(),
                 },
                 Vec::new(),
             ),
@@ -327,6 +338,7 @@ impl MicroExec {
             func_lo: func.entry,
             func_hi: func.entry.saturating_add(func.size),
             covered_bytes: 0,
+            callees: HashSet::new(),
         };
 
         let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, rec)?;
@@ -396,12 +408,15 @@ impl MicroExec {
         if capped {
             effects.push(Effect::Capped);
         }
+        let mut callees: Vec<u64> = rec.callees.iter().copied().collect();
+        callees.sort_unstable();
         Ok((
             EffectTrace {
                 effects,
                 instret,
                 capped,
                 coverage,
+                callees,
             },
             dirs,
         ))
@@ -565,10 +580,18 @@ fn install_hooks(uc: &mut Unicorn<Rec>) -> Result<(), unicorn_engine::uc_error> 
         }
 
         match kind {
-            Kind::Call { target } => {
+            Kind::Call { target, direct } => {
+                // `symbols` holds imports only (plt stubs + got slots), so a call
+                // names as Sym(import) or Anon on both a symboled and a stripped
+                // build. internal direct targets go to the callee edge list instead.
                 let name = target.and_then(|t| uc.get_data().symbols.get(&t).cloned());
                 let tag = {
                     let rec = uc.get_data_mut();
+                    if let (Some(t), true, None) = (target, direct, name.as_ref()) {
+                        if rec.segs.iter().any(|&(lo, hi)| t >= lo && t < hi) {
+                            rec.callees.insert(t);
+                        }
+                    }
                     rec.ret_ctr += 1;
                     rec.effects.push(Effect::Call(match name {
                         Some(n) => CallTarget::Sym(n),
@@ -646,16 +669,24 @@ fn decode(rec: &Rec, addr: u64, buf: &[u8]) -> (Kind, u64) {
     let m = insn.mnemonic().unwrap_or("");
 
     let kind = if m.starts_with("call") {
-        // direct call E8 rel32 -> resolve target, else indirect -> anon
-        let target = if buf[0] == 0xe8 {
+        // direct call E8 rel32 -> resolve target. `call [rip+disp32]` (ff 15, the
+        // -fno-plt / -z now shape) -> the got slot address, which the import map
+        // also keys. anything else is indirect -> anon.
+        let (target, direct) = if buf[0] == 0xe8 {
             let rel = i32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as i64;
             // wrapping: rip-relative math wraps on x86 and addr can sit near the
             // top of the space, so never let this overflow-panic
-            Some(addr.wrapping_add(ilen).wrapping_add(rel as u64))
+            (Some(addr.wrapping_add(ilen).wrapping_add(rel as u64)), true)
+        } else if buf[0] == 0xff && buf[1] == 0x15 {
+            let rel = i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]) as i64;
+            (
+                Some(addr.wrapping_add(ilen).wrapping_add(rel as u64)),
+                false,
+            )
         } else {
-            None
+            (None, false)
         };
-        Kind::Call { target }
+        Kind::Call { target, direct }
     } else if m == "ret" || m.starts_with("ret") {
         Kind::Ret
     } else if m == "syscall" || m == "sysenter" || m == "int" {

@@ -3,6 +3,8 @@
 //! .eh_frame FDE ranges when the thing is stripped, which covers most release
 //! binaries since they keep unwind info even without a symtab.
 
+use std::collections::HashMap;
+
 use anyhow::{bail, Context, Result};
 use goblin::elf::Elf;
 
@@ -62,6 +64,12 @@ impl Image {
 pub struct Loaded {
     pub image: Image,
     pub funcs: Vec<Func>,
+    /// plt stub address (and got slot address, for `call [rip+x]` -fno-plt style
+    /// calls) -> the imported symbol it resolves to. this is what survives
+    /// `strip --strip-all`: the dynamic linker still needs it. the emulator names
+    /// stubbed calls from this map only, never from internal symbols, so a
+    /// symboled corpus and a stripped target token their calls the same way.
+    pub imports: HashMap<u64, String>,
 }
 
 /// a single PT_LOAD bigger than this is refused rather than allocated. real RE
@@ -191,6 +199,7 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
     let is_pie = elf.header.e_type == goblin::elf::header::ET_DYN;
 
     let mut funcs = discover(&elf, bytes)?;
+    let imports = plt_imports(&elf, bytes);
     // sort + dedup by entry, prefer named entries
     funcs.sort_by(|a, b| {
         a.entry
@@ -206,6 +215,7 @@ pub fn load(bytes: &[u8]) -> Result<Loaded> {
             is_pie,
         },
         funcs,
+        imports,
     })
 }
 
@@ -269,6 +279,92 @@ fn discover(elf: &Elf, raw: &[u8]) -> Result<Vec<Func>> {
     }
 
     Ok(out)
+}
+
+// got slot -> import name, from the jump-slot (and glob_dat, for -z now / -fno-plt)
+// relocs, then every 16-byte stub in .plt / .plt.sec is scanned for the
+// `jmp [rip+disp32]` that goes through a known slot. keyed by stub address AND
+// slot address, the two never collide (different sections). plt0 (the lazy
+// resolver) jumps through GOT[2] which has no reloc, so it drops out on its own.
+fn plt_imports(elf: &Elf, raw: &[u8]) -> HashMap<u64, String> {
+    let mut out: HashMap<u64, String> = HashMap::new();
+    for r in elf
+        .pltrelocs
+        .iter()
+        .chain(elf.dynrelas.iter())
+        .chain(elf.dynrels.iter())
+    {
+        if out.len() >= MAX_FUNCS {
+            break;
+        }
+        let Some(sym) = elf.dynsyms.get(r.r_sym) else {
+            continue;
+        };
+        let Some(name) = elf.dynstrtab.get_at(sym.st_name) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        out.insert(r.r_offset, clamp_name(name));
+    }
+    if out.is_empty() {
+        return out;
+    }
+    let mut stubs: Vec<(u64, String)> = Vec::new();
+    for sh in &elf.section_headers {
+        let sname = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+        if sname != ".plt" && sname != ".plt.sec" {
+            continue;
+        }
+        let Ok(start) = usize::try_from(sh.sh_offset) else {
+            continue;
+        };
+        let Ok(size) = usize::try_from(sh.sh_size) else {
+            continue;
+        };
+        let Some(end) = start.checked_add(size) else {
+            continue;
+        };
+        let Some(data) = raw.get(start..end) else {
+            continue;
+        };
+        let mut off = 0usize;
+        while off + 16 <= data.len() && stubs.len() < MAX_FUNCS {
+            let stub = &data[off..off + 16];
+            if let Some(at) = find_jmp_rip(stub) {
+                let disp =
+                    i32::from_le_bytes([stub[at + 2], stub[at + 3], stub[at + 4], stub[at + 5]])
+                        as i64;
+                let stub_addr = sh.sh_addr.wrapping_add(off as u64);
+                let next = stub_addr.wrapping_add(at as u64 + 6);
+                let slot = next.wrapping_add(disp as u64);
+                if let Some(n) = out.get(&slot) {
+                    stubs.push((stub_addr, n.clone()));
+                }
+            }
+            off += 16;
+        }
+    }
+    out.extend(stubs);
+    out
+}
+
+// offset of `ff 25` (jmp qword [rip+disp32]) inside a plt stub, allowing the
+// endbr64 (f3 0f 1e fa) and bnd (f2) prefixes gcc/clang put in front of it.
+fn find_jmp_rip(stub: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    if stub.len() >= 4 && stub[..4] == [0xf3, 0x0f, 0x1e, 0xfa] {
+        i = 4;
+    }
+    if stub.get(i) == Some(&0xf2) {
+        i += 1;
+    }
+    if stub.len() >= i + 6 && stub[i] == 0xff && stub[i + 1] == 0x25 {
+        Some(i)
+    } else {
+        None
+    }
 }
 
 // pull function start+length out of every FDE in .eh_frame.

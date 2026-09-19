@@ -50,10 +50,19 @@ const EXPECTED_FUNCS_COLS: &[(&str, &str)] = &[
     ("shingles", "INTEGER"),
     ("capped", "INTEGER"),
     ("sig", "BLOB"),
+    ("callees", "BLOB"),
 ];
+// a corpus written before 0.6 has no callees column. it is still a valid corpus
+// (the fingerprints are unchanged), the call-graph pass just has no edges for it.
+const LEGACY_FUNCS_COLS: usize = EXPECTED_FUNCS_COLS.len() - 1;
+// most callee edges one row may carry (8 bytes each). a real function calls a
+// few dozen distinct things; this bounds a crafted row's blob to 32 KiB.
+const MAX_CALLEES: usize = 4096;
 
 pub struct Db {
     pub conn: Connection,
+    // false for a legacy (pre-0.6) image with no callees column
+    has_callees: bool,
 }
 
 // Serialize/Deserialize so a jailed db-reader worker can hand a decoded corpus
@@ -67,6 +76,9 @@ pub struct FuncRec {
     pub entry: u64,
     pub source: String,
     pub fp: Fingerprint,
+    /// direct in-image callee entries, empty for a legacy row
+    #[serde(default)]
+    pub callees: Vec<u64>,
 }
 
 /// One print to write, borrowed. The bulk-insert shape for `insert_all`: it holds
@@ -77,19 +89,26 @@ pub struct FuncPrint<'a> {
     pub entry: u64,
     pub source: &'a str,
     pub fp: &'a Fingerprint,
+    pub callees: &'a [u64],
 }
 
 impl Db {
     pub fn open(path: &str) -> Result<Db> {
         let conn = Connection::open(path)?;
         Self::init(&conn)?;
-        Ok(Db { conn })
+        Ok(Db {
+            conn,
+            has_callees: true,
+        })
     }
 
     pub fn open_memory() -> Result<Db> {
         let conn = Connection::open_in_memory()?;
         Self::init(&conn)?;
-        Ok(Db { conn })
+        Ok(Db {
+            conn,
+            has_callees: true,
+        })
     }
 
     /// Parse a corpus .db image entirely in memory, read-only. No file is ever
@@ -131,14 +150,15 @@ impl Db {
         // parse-and-check the physical schema before any row read. this also
         // forces sqlite to materialize the (lazily-parsed) schema now, so a
         // malformed schema surfaces here as a clean error, not mid-query.
-        Self::verify_funcs_schema(&conn)?;
-        Ok(Db { conn })
+        let has_callees = Self::verify_funcs_schema(&conn)?;
+        Ok(Db { conn, has_callees })
     }
 
     // assert `funcs` is an ordinary table with exactly the expected columns and
     // no hidden/generated columns. runs against the untrusted deserialized image,
-    // inside the jail, before all() reads anything.
-    fn verify_funcs_schema(conn: &Connection) -> Result<()> {
+    // inside the jail, before all() reads anything. returns whether the image
+    // carries the callees column (false = legacy corpus, still accepted).
+    fn verify_funcs_schema(conn: &Connection) -> Result<bool> {
         // funcs must be an ordinary table (not a view/virtual/shadow table).
         // pragma_table_list.type is 'table' | 'view' | 'virtual' | 'shadow'.
         let kind: Option<String> = conn
@@ -170,11 +190,12 @@ impl Db {
                 ))
             })?
             .collect::<std::result::Result<_, _>>()?;
-        if cols.len() != EXPECTED_FUNCS_COLS.len() {
+        if cols.len() != EXPECTED_FUNCS_COLS.len() && cols.len() != LEGACY_FUNCS_COLS {
             anyhow::bail!(
-                "corpus funcs has {} columns, expected {}",
+                "corpus funcs has {} columns, expected {} (or {} for a pre-0.6 corpus)",
                 cols.len(),
-                EXPECTED_FUNCS_COLS.len()
+                EXPECTED_FUNCS_COLS.len(),
+                LEGACY_FUNCS_COLS
             );
         }
         for ((name, ty, hidden), (exp_name, exp_ty)) in cols.iter().zip(EXPECTED_FUNCS_COLS) {
@@ -187,7 +208,7 @@ impl Db {
                 );
             }
         }
-        Ok(())
+        Ok(cols.len() == EXPECTED_FUNCS_COLS.len())
     }
 
     fn init(conn: &Connection) -> Result<()> {
@@ -201,7 +222,8 @@ impl Db {
                 complexity INTEGER NOT NULL,
                 shingles INTEGER NOT NULL,
                 capped INTEGER NOT NULL,
-                sig BLOB NOT NULL
+                sig BLOB NOT NULL,
+                callees BLOB
             );
             CREATE TABLE IF NOT EXISTS bands(
                 band INTEGER NOT NULL,
@@ -210,7 +232,27 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS bands_lookup ON bands(band, key);",
         )?;
+        // a pre-0.6 file opened for writing: grow it in place so new rows can
+        // carry edges. old rows read back with no callees, which is fine.
+        let ncols: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_xinfo('funcs')",
+            [],
+            |r| r.get(0),
+        )?;
+        if ncols == LEGACY_FUNCS_COLS as i64 {
+            conn.execute_batch("ALTER TABLE funcs ADD COLUMN callees BLOB")?;
+        }
         Ok(())
+    }
+
+    // the select list for a row, with callees read as an empty blob on a
+    // legacy image so row_to_rec sees one shape.
+    fn row_select(&self) -> &'static str {
+        if self.has_callees {
+            "id,binary,name,entry,source,complexity,shingles,capped,sig,callees"
+        } else {
+            "id,binary,name,entry,source,complexity,shingles,capped,sig,x''"
+        }
     }
 
     pub fn insert(
@@ -220,10 +262,12 @@ impl Db {
         entry: u64,
         source: &str,
         fp: &Fingerprint,
+        callees: &[u64],
     ) -> Result<i64> {
+        let callees = &callees[..callees.len().min(MAX_CALLEES)];
         self.conn.execute(
-            "INSERT INTO funcs(binary,name,entry,source,complexity,shingles,capped,sig)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO funcs(binary,name,entry,source,complexity,shingles,capped,sig,callees)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 binary,
                 name,
@@ -232,7 +276,8 @@ impl Db {
                 fp.complexity as i64,
                 fp.shingles as i64,
                 fp.capped as i64,
-                encode_sig(&fp.sig)
+                encode_sig(&fp.sig),
+                encode_sig(callees)
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -261,7 +306,7 @@ impl Db {
         // COMMIT on commit(); a drop without commit rolls back.
         let tx = self.conn.unchecked_transaction()?;
         for p in prints {
-            self.insert(binary, p.name, p.entry, p.source, p.fp)?;
+            self.insert(binary, p.name, p.entry, p.source, p.fp, p.callees)?;
         }
         tx.commit()?;
         Ok(prints.len())
@@ -273,14 +318,15 @@ impl Db {
         // path or symbol name, so this only ever drops crafted rows, never legit
         // ones. defense in depth: all() runs in the jailed worker, already backed
         // by RLIMIT_AS and the reply cap, this just skips the alloc earlier.
-        let mut st = self.conn.prepare(
-            "SELECT id,binary,name,entry,source,complexity,shingles,capped,sig
-             FROM funcs
+        let sql = format!(
+            "SELECT {} FROM funcs
              WHERE octet_length(sig)=?1
                AND octet_length(binary)<=?2
                AND (name IS NULL OR octet_length(name)<=?2)
                AND octet_length(source)<=?2",
-        )?;
+            self.row_select()
+        );
+        let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map(params![SIG_BYTES, MAX_TEXT], |r| Ok(row_to_rec(r)))?;
         let mut out = Vec::new();
         let mut total_bytes: u64 = 0;
@@ -326,18 +372,19 @@ impl Db {
                 }
             }
         }
-        let mut row_st = self.conn.prepare(
-            // same absurd-text guard as all(): a crafted corpus row with a huge
-            // binary/name/source string is skipped in sqlite before we materialize
-            // it, not just dropped after the alloc. keeps this path (index --out +
-            // tests) consistent with all()'s defense in depth.
-            "SELECT id,binary,name,entry,source,complexity,shingles,capped,sig
-             FROM funcs
+        // same absurd-text guard as all(): a crafted corpus row with a huge
+        // binary/name/source string is skipped in sqlite before we materialize
+        // it, not just dropped after the alloc. keeps this path (index --out +
+        // tests) consistent with all()'s defense in depth.
+        let sql = format!(
+            "SELECT {} FROM funcs
              WHERE id=?1 AND octet_length(sig)=?2
                AND octet_length(binary)<=?3
                AND (name IS NULL OR octet_length(name)<=?3)
                AND octet_length(source)<=?3",
-        )?;
+            self.row_select()
+        );
+        let mut row_st = self.conn.prepare(&sql)?;
         let mut out = Vec::new();
         for id in ids {
             // a band pointing at a missing or wrong-sized row (corrupt/crafted
@@ -455,6 +502,7 @@ fn rec_bytes(rec: &FuncRec) -> u64 {
         .saturating_add(rec.binary.len() as u64)
         .saturating_add(name as u64)
         .saturating_add(rec.source.len() as u64)
+        .saturating_add((rec.callees.len() * 8) as u64)
 }
 
 // true if any single text field exceeds the byte cap. the SQL octet_length guard
@@ -478,6 +526,11 @@ fn row_to_rec(r: &rusqlite::Row) -> Result<FuncRec> {
         complexity: u32::try_from(r.get::<_, i64>(5)?).unwrap_or(0),
         capped: r.get::<_, i64>(7)? != 0,
     };
+    // NULL (a row written by an older fnprint into an upgraded file) reads as
+    // no edges. cap the blob before decoding so a crafted row can't grow the Vec.
+    let cb: Option<Vec<u8>> = r.get(9)?;
+    let cb = cb.unwrap_or_default();
+    let cb = &cb[..cb.len().min(MAX_CALLEES * 8)];
     Ok(FuncRec {
         id: r.get(0)?,
         binary: r.get(1)?,
@@ -485,6 +538,7 @@ fn row_to_rec(r: &rusqlite::Row) -> Result<FuncRec> {
         entry: r.get::<_, i64>(3)? as u64,
         source: r.get(4)?,
         fp,
+        callees: decode_sig(cb),
     })
 }
 
@@ -542,9 +596,9 @@ mod tests {
     #[test]
     fn roundtrip_and_candidates() {
         let db = Db::open_memory().unwrap();
-        db.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0))
+        db.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
             .unwrap();
-        db.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(999))
+        db.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(999), &[])
             .unwrap();
         assert_eq!(db.all().unwrap().len(), 2);
         // querying with foo's own print must surface foo as a candidate
@@ -596,9 +650,9 @@ mod tests {
         // a batch insert must land exactly the rows (funcs + bands) that the same
         // prints inserted one at a time would, just under one commit.
         let one = Db::open_memory().unwrap();
-        one.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0))
+        one.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
             .unwrap();
-        one.insert("a.bin", None, 0x2000, "eh_frame", &fp(7))
+        one.insert("a.bin", None, 0x2000, "eh_frame", &fp(7), &[])
             .unwrap();
 
         let batch = Db::open_memory().unwrap();
@@ -613,12 +667,14 @@ mod tests {
                         entry: 0x1000,
                         source: "symtab",
                         fp: &f0,
+                        callees: &[],
                     },
                     FuncPrint {
                         name: None,
                         entry: 0x2000,
                         source: "eh_frame",
                         fp: &f7,
+                        callees: &[],
                     },
                 ],
             )
@@ -660,12 +716,14 @@ mod tests {
                     entry: 0x1000,
                     source: "symtab",
                     fp: &f0,
+                    callees: &[],
                 },
                 FuncPrint {
                     name: Some("dup"),
                     entry: 0x1000, // same entry -> UNIQUE violation on row 2
                     source: "symtab",
                     fp: &f1,
+                    callees: &[],
                 },
             ],
         );
@@ -680,7 +738,7 @@ mod tests {
     #[test]
     fn corrupt_sig_row_is_skipped_not_fatal() {
         let db = Db::open_memory().unwrap();
-        db.insert("a.bin", Some("good"), 0x1000, "symtab", &fp(0))
+        db.insert("a.bin", Some("good"), 0x1000, "symtab", &fp(0), &[])
             .unwrap();
         // craft a row with a wrong-sized sig blob, like a corrupt or malicious
         // corpus would have. it must be skipped, and it must not make us try to
@@ -711,12 +769,12 @@ mod tests {
     #[test]
     fn oversized_text_row_is_skipped() {
         let db = Db::open_memory().unwrap();
-        db.insert("a.bin", Some("good"), 0x1000, "symtab", &fp(0))
+        db.insert("a.bin", Some("good"), 0x1000, "symtab", &fp(0), &[])
             .unwrap();
         // a crafted corpus with a huge binary-name string. all() must skip it
         // rather than materialize a multi-MB String per row.
         let huge = "x".repeat((MAX_TEXT as usize) + 1);
-        db.insert(&huge, Some("bad"), 0x2000, "symtab", &fp(1))
+        db.insert(&huge, Some("bad"), 0x2000, "symtab", &fp(1), &[])
             .unwrap();
         let all = db.all().unwrap();
         assert_eq!(all.len(), 1, "only the sane-sized row should load");
@@ -732,9 +790,9 @@ mod tests {
     #[test]
     fn open_image_reads_a_corpus_in_memory() {
         let src = Db::open_memory().unwrap();
-        src.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0))
+        src.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
             .unwrap();
-        src.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(999))
+        src.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(999), &[])
             .unwrap();
         let image = image_of(&src);
 
@@ -748,7 +806,7 @@ mod tests {
     #[test]
     fn open_image_is_read_only() {
         let src = Db::open_memory().unwrap();
-        src.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0))
+        src.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
             .unwrap();
         let db = Db::open_image(&image_of(&src)).unwrap();
         // a deserialized image is read-only: any write must be refused, not
@@ -819,7 +877,7 @@ mod tests {
 
     #[test]
     fn rejects_extra_column() {
-        // an extra column past the expected 9 changes the physical shape; reject.
+        // a 10th column that is not `callees BLOB` is a different physical shape; reject.
         let img = crafted_image(
             "CREATE TABLE funcs(
                  id INTEGER PRIMARY KEY, binary TEXT NOT NULL, name TEXT, entry INTEGER NOT NULL,
@@ -830,7 +888,70 @@ mod tests {
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
+        assert!(e.contains("mismatch"), "got: {e}");
+        // and one past the full 10 is rejected on count.
+        let img = crafted_image(
+            "CREATE TABLE funcs(
+                 id INTEGER PRIMARY KEY, binary TEXT NOT NULL, name TEXT, entry INTEGER NOT NULL,
+                 source TEXT NOT NULL, complexity INTEGER NOT NULL, shingles INTEGER NOT NULL,
+                 capped INTEGER NOT NULL, sig BLOB NOT NULL, callees BLOB, extra INTEGER);",
+        );
+        let e = Db::open_image(&img)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(e.contains("columns"), "got: {e}");
+    }
+
+    #[test]
+    fn legacy_nine_column_corpus_reads_with_no_edges() {
+        // a pre-0.6 corpus has no callees column. it must still open and read,
+        // rows come back with empty callees, and the fingerprint is intact.
+        let src = Connection::open_in_memory().unwrap();
+        src.execute_batch(
+            "CREATE TABLE funcs(
+                 id INTEGER PRIMARY KEY, binary TEXT NOT NULL, name TEXT, entry INTEGER NOT NULL,
+                 source TEXT NOT NULL, complexity INTEGER NOT NULL, shingles INTEGER NOT NULL,
+                 capped INTEGER NOT NULL, sig BLOB NOT NULL);
+             CREATE TABLE bands(band INTEGER NOT NULL, key INTEGER NOT NULL, func_id INTEGER NOT NULL);",
+        )
+        .unwrap();
+        let f = fp(3);
+        src.execute(
+            "INSERT INTO funcs(binary,name,entry,source,complexity,shingles,capped,sig)
+             VALUES('a.bin','foo',4096,'symtab',9,20,0,?1)",
+            params![encode_sig(&f.sig)],
+        )
+        .unwrap();
+        let img = src.serialize(MAIN_DB).unwrap().to_vec();
+        let db = Db::open_image(&img).unwrap();
+        let recs = db.all().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].callees.is_empty());
+        assert_eq!(recs[0].fp.sig, f.sig);
+        assert_eq!(recs[0].name.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn callees_round_trip_and_cap() {
+        let db = Db::open_memory().unwrap();
+        db.insert(
+            "a.bin",
+            Some("foo"),
+            0x1000,
+            "symtab",
+            &fp(0),
+            &[0x2000, 0x3000],
+        )
+        .unwrap();
+        // a row with more edges than the cap is truncated at insert
+        let big: Vec<u64> = (0..(MAX_CALLEES as u64 + 10)).collect();
+        db.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(1), &big)
+            .unwrap();
+        let mut recs = db.all().unwrap();
+        recs.sort_by_key(|r| r.entry);
+        assert_eq!(recs[0].callees, vec![0x2000, 0x3000]);
+        assert_eq!(recs[1].callees.len(), MAX_CALLEES);
     }
 
     #[test]
@@ -855,7 +976,7 @@ mod tests {
         // over it must be dropped: the guard is octet_length (bytes), not length
         // (chars). 400k 3-byte chars = 1.2 MiB > MAX_TEXT but only 400k chars.
         let src = Db::open_memory().unwrap();
-        src.insert("a.bin", Some("good"), 0x1000, "symtab", &fp(0))
+        src.insert("a.bin", Some("good"), 0x1000, "symtab", &fp(0), &[])
             .unwrap();
         let wide = "\u{3042}".repeat(400_000); // 'HIRAGANA A', 3 bytes each
         assert!(
@@ -866,7 +987,7 @@ mod tests {
             (wide.len() as i64) > MAX_TEXT,
             "byte count must be over cap"
         );
-        src.insert("b.bin", Some(&wide), 0x2000, "symtab", &fp(1))
+        src.insert("b.bin", Some(&wide), 0x2000, "symtab", &fp(1), &[])
             .unwrap();
         let db = Db::open_image(&image_of(&src)).unwrap();
         let all = db.all().unwrap();
@@ -878,7 +999,7 @@ mod tests {
     fn wellformed_image_still_passes_schema_check() {
         // the schema verifier must accept a corpus our own init() produced.
         let src = Db::open_memory().unwrap();
-        src.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0))
+        src.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
             .unwrap();
         let db = Db::open_image(&image_of(&src)).unwrap();
         assert_eq!(db.all().unwrap().len(), 1);
@@ -887,9 +1008,9 @@ mod tests {
     #[test]
     fn memcorpus_matches_db_semantics() {
         let db = Db::open_memory().unwrap();
-        db.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0))
+        db.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
             .unwrap();
-        db.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(999))
+        db.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(999), &[])
             .unwrap();
 
         // MemCorpus built from the same rows must answer all()/candidates() the

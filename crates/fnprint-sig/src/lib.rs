@@ -187,6 +187,7 @@ mod tests {
             instret: 100,
             capped: false,
             coverage: 1.0,
+            callees: Vec::new(),
         }
     }
 

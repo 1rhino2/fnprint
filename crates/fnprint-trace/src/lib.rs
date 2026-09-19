@@ -172,6 +172,12 @@ pub struct EffectTrace {
     /// behavior. surfaced to the analyst; not used to gate a verdict (complex
     /// input-driven functions legitimately run almost none of their body).
     pub coverage: f32,
+    /// entries of the functions this one called directly inside its own image
+    /// (not imports), deduped + sorted. NOT part of the tokens (addresses do not
+    /// survive a recompile); it is the call-graph edge list the matcher uses to
+    /// propagate confident matches to neighbours.
+    #[serde(default)]
+    pub callees: Vec<u64>,
 }
 
 impl EffectTrace {
@@ -258,6 +264,7 @@ mod tests {
             instret: 2,
             capped: false,
             coverage: 1.0,
+            callees: Vec::new(),
         };
         assert!(thunk.complexity() < 3);
         let real = EffectTrace {
@@ -273,6 +280,7 @@ mod tests {
             instret: 40,
             capped: false,
             coverage: 1.0,
+            callees: Vec::new(),
         };
         assert!(real.complexity() >= 3);
     }

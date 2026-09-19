@@ -47,6 +47,10 @@ pub struct IndexedFunc {
     /// results so a low-coverage match can be discounted by a human. not a gate.
     #[serde(default = "default_coverage")]
     pub coverage: f32,
+    /// direct in-image callees (entries), union over the seed runs. call-graph
+    /// edges for match-time propagation; empty for an old corpus row.
+    #[serde(default)]
+    pub callees: Vec<u64>,
 }
 
 // default for a missing coverage field. the worker reply is postcard (positional,
@@ -104,18 +108,12 @@ pub fn index_bytes_shard(
     let loaded = fnprint_loader::load(bytes)?;
     let image = &loaded.image;
 
-    // entry -> name, so stubbed calls can be resolved to a symbol. every shard
-    // builds the FULL symbol map (cheap) so stubbed-call naming is complete no
-    // matter which functions this shard actually emulates.
-    let mut symbols: HashMap<u64, String> = HashMap::new();
-    for f in &loaded.funcs {
-        if let Some(n) = &f.name {
-            symbols.insert(f.entry, n.clone());
-        }
-    }
-    // one Arc for the whole shard: each per-function run clones the handle, not
-    // the map. built once here, shared read-only across the rayon workers.
-    let symbols = Arc::new(symbols);
+    // stubbed calls are named from the IMPORT map only (plt stubs, got slots).
+    // internal symbol names are gone on a stripped target, so naming them in the
+    // corpus would make the two sides token the same call differently. imports
+    // survive strip, so they are the stable part. internal direct calls are kept
+    // as callee edges instead and used by the call-graph pass at match time.
+    let symbols = Arc::new(loaded.imports.clone());
 
     let out: Vec<IndexedFunc> = loaded
         .funcs
@@ -143,12 +141,19 @@ pub fn index_bytes_shard(
             // body is actually observable, since input-dependent branches differ
             // by seed. from_traces already unions the effects.
             let coverage = traces.iter().map(|t| t.coverage).fold(0.0f32, f32::max);
+            let mut callees: Vec<u64> = traces
+                .iter()
+                .flat_map(|t| t.callees.iter().copied())
+                .collect();
+            callees.sort_unstable();
+            callees.dedup();
             IndexedFunc {
                 name: f.name.clone(),
                 entry: f.entry,
                 source: f.source,
                 fp: Fingerprint::from_traces(&traces),
                 coverage,
+                callees,
             }
         })
         .collect();
@@ -165,6 +170,7 @@ pub fn index_to_db(bytes: &[u8], binary: &str, db: &Db, cfg: Config) -> Result<u
             entry: f.entry,
             source: source_str(f.source),
             fp: &f.fp,
+            callees: &f.callees,
         })
         .collect();
     // one transaction instead of a commit per print, see Db::insert_all
@@ -572,13 +578,7 @@ pub fn dump_traces(
 ) -> Result<Vec<fnprint_trace::EffectTrace>> {
     let loaded = fnprint_loader::load(bytes)?;
     let image = &loaded.image;
-    let mut symbols: HashMap<u64, String> = HashMap::new();
-    for f in &loaded.funcs {
-        if let Some(n) = &f.name {
-            symbols.insert(f.entry, n.clone());
-        }
-    }
-    let symbols = Arc::new(symbols);
+    let symbols = Arc::new(loaded.imports.clone());
     let f = loaded
         .funcs
         .iter()
@@ -609,6 +609,7 @@ mod tests {
                 capped: false,
             },
             coverage: 1.0,
+            callees: Vec::new(),
         }
     }
 
@@ -645,11 +646,25 @@ mod tests {
         // a target that behaves like seed 3 must come back Vulnerable, and one
         // like seed 999 must come back Patched.
         let vuln = Db::open_memory().unwrap();
-        vuln.insert("v1", Some("f"), 0x1000, "symtab", &ifunc("f", 3, 10).fp)
-            .unwrap();
+        vuln.insert(
+            "v1",
+            Some("f"),
+            0x1000,
+            "symtab",
+            &ifunc("f", 3, 10).fp,
+            &[],
+        )
+        .unwrap();
         let patched = Db::open_memory().unwrap();
         patched
-            .insert("v2", Some("f"), 0x1000, "symtab", &ifunc("f", 999, 10).fp)
+            .insert(
+                "v2",
+                Some("f"),
+                0x1000,
+                "symtab",
+                &ifunc("f", 999, 10).fp,
+                &[],
+            )
             .unwrap();
 
         let looks_vuln = triage(&[ifunc("x", 3, 10)], &vuln, &patched, 0.5, 0.1).unwrap();
@@ -667,11 +682,25 @@ mod tests {
         // (else the crown-jewel functions, which run almost none of their body,
         // would never get a call).
         let vuln = Db::open_memory().unwrap();
-        vuln.insert("v1", Some("f"), 0x1000, "symtab", &ifunc("f", 3, 10).fp)
-            .unwrap();
+        vuln.insert(
+            "v1",
+            Some("f"),
+            0x1000,
+            "symtab",
+            &ifunc("f", 3, 10).fp,
+            &[],
+        )
+        .unwrap();
         let patched = Db::open_memory().unwrap();
         patched
-            .insert("v2", Some("f"), 0x1000, "symtab", &ifunc("f", 999, 10).fp)
+            .insert(
+                "v2",
+                Some("f"),
+                0x1000,
+                "symtab",
+                &ifunc("f", 999, 10).fp,
+                &[],
+            )
             .unwrap();
 
         let mut t = ifunc("x", 3, 10);
@@ -688,11 +717,25 @@ mod tests {
     fn triage_abstains_when_nothing_close() {
         // target matches neither side -> below min_sim -> Inconclusive
         let vuln = Db::open_memory().unwrap();
-        vuln.insert("v1", Some("f"), 0x1000, "symtab", &ifunc("f", 3, 10).fp)
-            .unwrap();
+        vuln.insert(
+            "v1",
+            Some("f"),
+            0x1000,
+            "symtab",
+            &ifunc("f", 3, 10).fp,
+            &[],
+        )
+        .unwrap();
         let patched = Db::open_memory().unwrap();
         patched
-            .insert("v2", Some("f"), 0x1000, "symtab", &ifunc("f", 999, 10).fp)
+            .insert(
+                "v2",
+                Some("f"),
+                0x1000,
+                "symtab",
+                &ifunc("f", 999, 10).fp,
+                &[],
+            )
             .unwrap();
 
         let hits = triage(&[ifunc("x", 55555, 10)], &vuln, &patched, 0.9, 0.1).unwrap();
