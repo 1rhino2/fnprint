@@ -7,6 +7,14 @@ Dates are the tag dates. Older entries are summarized from the release commits.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-08
+
+### Changed
+- unicorn-tci 2.1.6 is on crates.io, so the emulator dependency is a plain
+  registry pin again instead of the fork's git tag. This is what lets
+  `cargo install fnprint` serve 0.6 (0.6.0 could not be published with a git
+  dependency). No code change.
+
 ## [0.6.0] - 2026-09-19
 
 ### Added
@@ -172,7 +180,8 @@ First tagged release. Builds on the initial behavioral-fingerprinting engine
 ### Security
 - Sandboxed the emulator, hardened the build.
 
-[Unreleased]: https://github.com/1rhino2/fnprint/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/1rhino2/fnprint/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/1rhino2/fnprint/releases/tag/v0.6.1
 [0.6.0]: https://github.com/1rhino2/fnprint/releases/tag/v0.6.0
 [0.5.1]: https://github.com/1rhino2/fnprint/releases/tag/v0.5.1
 [0.5.0]: https://github.com/1rhino2/fnprint/releases/tag/v0.5.0
